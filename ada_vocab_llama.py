@@ -13,12 +13,11 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaPreTrained
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-
+# TODO: set and get these hyperparameters from ENV or config file
 ADA_RATIO = 4
-ADA_TOPK = 20
+ADA_TOPK = 200
 ADA_LOSS_WEIGHT = 0.1 # lm_loss: 10.375   mask_loss: 0.6931
 ADA_TOPK_WEIGHT = 0.00000005 # topk_loss: 32727040
-# ADA_LOSS_WEIGHT * lm_loss + mask_loss + ADA_TOPK_WEIGHT * topk_loss
 
 @dataclass
 class AdaCausalLMOutputWithPast(CausalLMOutputWithPast):
@@ -52,7 +51,7 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
 
     def __init__(self, config):
         super().__init__(config)
-        self.sub_vocab_dim = config.vocab_size // ADA_RATIO  
+        self.sub_vocab_dim = config.hidden_size // ADA_RATIO  
         self.topK = ADA_TOPK
         # AdaVocabHead is already initialized with random weights, 
         # so no need to use `self.post_init` method after this

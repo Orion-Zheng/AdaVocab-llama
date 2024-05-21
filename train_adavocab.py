@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import random
 import torch.nn.functional as F
+from torch.nn.parallel.distributed import DistributedDataParallel
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import (Trainer, AutoModelForCausalLM,
                           PreTrainedTokenizer,
@@ -25,12 +26,12 @@ from codebase.utils import print_trainable_parameters, load_tokenizer, prepare_f
 from codebase.args_parser import parse_args
 from codebase.dist_logging import get_dist_logger
 
-from adavocab import AdaVocabLlamaForCausalLM, AdaCausalLMOutputWithPast
-
+from adavocab_llama.ada_vocab_llama import AdaVocabLlamaForCausalLM, AdaCausalLMOutputWithPast, ADA_TOPK
+from adavocab_llama.ada_trainer import AdaTrainer
 # can skip if you have already logged in at console by 'wandb login'
-import wandb
-wandb.login(key="a412c1e679c25ec529ba4dcfd0ec19e74c45f8cb")
-wandb.init(project='adaVocab', name='compute_loss test2024_05_17_01')
+# import wandb
+# wandb.login(key="")
+# wandb.init(project='', name='')
 
 logger = get_dist_logger()
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'
@@ -39,12 +40,6 @@ IGNORE_INDEX = -100
 SAFE_MINUTES = 5
 
 SafeSavingCallback_NSCC.safe_minutes = SAFE_MINUTES
-
-ADA_RATIO = 4
-ADA_TOPK = 20
-ADA_LOSS_WEIGHT = 0.1 # lm_loss: 10.375   mask_loss: 0.6931
-ADA_TOPK_WEIGHT = 0.00000005 # topk_loss: 32727040
-# ADA_LOSS_WEIGHT * lm_loss + mask_loss + ADA_TOPK_WEIGHT * topk_loss
     
 @dataclass
 class PaddToMaxLenCollator(object):
@@ -90,59 +85,6 @@ def enable_monkey_patch():
     WandbCallback.on_train_end = new_wandb_on_train_end
 
 
-class AdaLossWandbCallback(TrainerCallback):
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        # 使用wandb记录额外的损失值
-        # 如果是多机器，可能需要使用commit=False
-        print("reflectio step: {}".format(state.global_step))
-        wandb.log({
-            "weighted_lm_loss": model.weighted_lm_loss.item(),
-            "mask_loss": model.mask_loss.item(),
-            "weighted_topk_loss": model.weighted_topk_loss.item()
-                }, 
-                #   step=state.global_step
-                )
-        
-# Customized for training adaVocab heads
-class AdaTrainer(Trainer):
-
-    def compute_loss(
-        self,
-        model,
-        inputs,
-        return_outputs=False,
-    ):
-        """
-        # TODO: check multi-GPU setting.
-        Compute the training loss for the model.
-
-        Args:
-            model (torch.nn.Module): The model for which to compute the loss.
-            inputs (dict): The input data, including input IDs, attention mask, and labels.
-            return_outputs (bool): Whether to return model outputs along with the loss.
-
-        Returns:
-            Union[float, Tuple[float, torch.Tensor]]: The computed loss, optionally with model outputs.
-        """
-        outputs = model(**inputs)
-        loss = outputs.loss
-
-        # TODO: Multi-GPU?
-        model.weighted_lm_loss = outputs.lm_loss.clone()
-        model.mask_loss = outputs.mask_loss.clone()
-        model.weighted_topk_loss = outputs.topk_loss.clone()
-        
-        # TODO: we need to handle this in outer evaluation loop for log
-        outputs.lm_head_logits = None
-        outputs.lm_loss = None
-        outputs.mask_loss = None
-        outputs.topk_loss = None
-        
-        # In `training_step`, `return_outputs=False` --> only return `loss`
-        # In `prediction_step`, `return_outputs=True` --> return `loss`` and `outputs`(logits, hidden_states, ...)
-        return (loss, outputs) if return_outputs else loss
-
-
 def main():
     enable_monkey_patch() 
     
@@ -166,23 +108,97 @@ def main():
     
     def compute_metrics(eval_preds):
         """
-        Tingyuan: Add eval compute metrics
-        Some messages from (compute_metrics): https://zhuanlan.zhihu.com/p/414553911
-        (load_metric): https://zhuanlan.zhihu.com/p/653820729
+        Sum the metrics of all batches and return the average.
+        eval_preds.shape: (num_batch, ) * num of metrics
         """
-        metric = load_metric("glue", "mrpc")
-        logits, labels = eval_preds.predictions, eval_preds.label_ids
-        # 上一行可以直接简写成：
-        # logits, labels = eval_preds  因为它相当于一个tuple
-        predictions = np.argmax(logits, axis=-1)
-        return metric.compute(predictions=predictions, references=labels)
+        token_accuracy, mask_hit_rate, top_k_diff, lm_loss, mask_loss, topk_loss = eval_preds.predictions
+        return {'token_accuracy': token_accuracy.mean().item(), 
+                'mask_hit_rate': mask_hit_rate.mean().item(), 
+                'top_k_diff': top_k_diff.mean().item(),
+                'lm_loss': lm_loss.mean().item(),
+                'mask_loss': mask_loss.mean().item(),
+                'topk_loss': topk_loss.mean().item()}
+    
+    def get_topk_logits(logits, topk):
+        # logits: (bs * seq_len, vocab_size)
+        # get the topk largest values and their indices, top_k_indices: (bs * seq_len, topk)
+        _, topk_indices = logits.topk(topk, dim=1)
+
+        topk_logits = torch.zeros_like(logits)
+        ones = torch.ones_like(topk_indices, dtype=torch.float)
+
+        # set the topk_indices to 1, others to 0, in `vocab_size` dimension
+        topk_logits.scatter_(1, topk_indices, ones)
+        return topk_logits
+    
+    def get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_topk):
+        product = lm_head_logits_topk * ada_logits_topk
+
+        # count the number of 1s at each position
+        # sum along the vocab_size dimension and keep the dimension unchanged
+        hit_count_tensor = product.sum(dim=-1, keepdim=True)  
+        hit_rate_tensor = hit_count_tensor / ADA_TOPK
+        
+        return hit_rate_tensor.mean()
+    
+    def count_token_level_positive(ada_logits_viewed):
+        # greater_than_zero: (bs * seq_len, vocab_size)
+        # greater_than_zero --> positive result after applying the sigmoid
+        greater_than_zero = ada_logits_viewed > 0
+
+        # count the number of positive values at each position along the vocab_size dimension
+        count_greater_than_zero = greater_than_zero.int().sum(dim=1, keepdim=True)
+        return count_greater_than_zero.float().mean()
+    
+    def calculate_token_accuracy(shift_labels, shift_logits_argmax):
+        assert shift_labels.shape == shift_logits_argmax.shape, 'shift_labels and shift_logits_argmax should have the same torch size'
+
+        # compare the elements of two tensors and calculate the number of equal elements
+        equal_elements = shift_labels.eq(shift_logits_argmax)
+        num_equal_elements = equal_elements.sum()
+        # get the number of total elements
+        total_elements = shift_labels.numel()
+        # calculate the ratio of equal elements
+        equal_ratio = num_equal_elements / total_elements
+        return equal_ratio
 
     def preprocess_logits_for_metrics(logits, labels):
         """
-        Tingyuan: Add preprocess_logits_for_metrics
+        Add preprocess_logits_for_metrics
+        
+        logits.keys(): ['logits', 'lm_head_logits', 'lm_loss', 'mask_loss', 'topk_loss']
+        
         """
-        # print(logits, labels)
-        return (logits, labels)
+        ada_logits = logits[0]       # torch.Size([2, 2048, 32000]) (bs, seq_len, vocab_size)
+        lm_head_logits = logits[1]   # torch.Size([2, 2048, 32000])
+        lm_loss = logits[2] 
+        mask_loss = logits[3]
+        topk_loss = logits[4]
+        assert ada_logits.shape == lm_head_logits.shape, "ada_logits and lm_head_logits should have the same shape."
+        
+        bs = ada_logits.shape[0]
+        seq_len = ada_logits.shape[1]
+        vocab_size = ada_logits.shape[2]
+        
+        token_accuracy = None # SHIFT token_level
+        mask_hit_rate = None   # token_level
+        top_k_diff = None   #  token_level
+        
+        # mask_hit_rate
+        ada_logits_topk = get_topk_logits(ada_logits.view(bs * seq_len, vocab_size), ADA_TOPK) # (bs * seq_len, vocab_size)
+        lm_head_logits_topk = get_topk_logits(lm_head_logits.view(bs * seq_len, vocab_size), ADA_TOPK) # (bs * seq_len, vocab_size) ,  torch.unique(lm_head_logits_topk): tensor([0., 1.], device='cuda:0')
+        mask_hit_rate = get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_topk) # token_level
+
+        # top_k_diff
+        top_k_diff = count_token_level_positive(ada_logits.view(bs * seq_len, vocab_size)) - ADA_TOPK # token_level
+        
+        # token_accuracy
+        shift_logits = ada_logits[..., :-1, :].contiguous().view(-1, vocab_size)  # (batch_size * (seq_len - 1), vocab_size)
+        shift_logits_argmax = torch.argmax(shift_logits, dim=1).view(bs * (seq_len - 1))
+        shift_labels = labels[..., 1:].contiguous().view(-1)
+        token_accuracy = calculate_token_accuracy(shift_labels, shift_logits_argmax)
+        
+        return (token_accuracy, mask_hit_rate, top_k_diff, lm_loss, mask_loss, topk_loss)
     
     trainer = AdaTrainer(
         model=model,
@@ -190,7 +206,6 @@ def main():
         eval_dataset=eval_data, 
         args=trainer_config,
         data_collator=PaddToMaxLenCollator(tokenizer, model_args.max_length), 
-        callbacks=[AdaLossWandbCallback()],
         compute_metrics=compute_metrics, # Tingyuan
         preprocess_logits_for_metrics=preprocess_logits_for_metrics   # Tingyuan
         # callbacks=[SafeSavingCallback_NSCC]  # only for for PBS Pro Cluster(e.g. NSCC)
