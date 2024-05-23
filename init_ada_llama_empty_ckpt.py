@@ -29,6 +29,9 @@ if __name__ == '__main__':
     set_model_config(config, ada_config)
 
     output_path = os.path.join(output_dir, f'ada-{model_name}-empty_{config_name}')
-    AdaVocabLlamaForCausalLM.from_pretrained(model_path, config=config).save_pretrained(output_path)
-    AutoTokenizer.from_pretrained(model_path).save_pretrained(output_path)
-    config.save_pretrained(output_path)
+    if os.path.exists(output_path):
+        print(f"Model already exists at {output_path}. Skipping...")
+    else:
+        AdaVocabLlamaForCausalLM.from_pretrained(model_path, config=config).save_pretrained(output_path)
+        AutoTokenizer.from_pretrained(model_path).save_pretrained(output_path)
+        config.save_pretrained(output_path)
