@@ -26,7 +26,7 @@ from codebase.utils import print_trainable_parameters, load_tokenizer, prepare_f
 from codebase.args_parser import parse_args
 from codebase.dist_logging import get_dist_logger
 
-from adavocab_llama.ada_vocab_llama import AdaVocabLlamaForCausalLM, AdaCausalLMOutputWithPast, ADA_TOPK
+from adavocab_llama.ada_vocab_llama import AdaVocabLlamaForCausalLM, AdaCausalLMOutputWithPast
 from adavocab_llama.ada_trainer import AdaTrainer
 # can skip if you have already logged in at console by 'wandb login'
 # import wandb
@@ -253,7 +253,8 @@ def main():
     
     # Training
     if model_args.do_train:
-        train_result = trainer.train(resume_from_checkpoint=model_args.resume_from_checkpoint)
+        train_result, model_at_end = trainer.train(resume_from_checkpoint=model_args.resume_from_checkpoint)
+        trainer.save_final_checkpoint(model_at_end)
         trainer.log_metrics("train", train_result.metrics)  # e.g {'train_runtime': 112.9526, 'train_samples_per_second': 0.142, 'train_steps_per_second': 0.035, 'train_loss': 9.430782318115234, 'epoch': 0.0, 'num_input_tokens_seen': 14166}
         trainer.save_metrics("train", train_result.metrics)  # all_results.json
 

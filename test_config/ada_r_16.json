@@ -1,0 +1,7 @@
+{
+  "ADA_RATIO": 16,
+  "ADA_TOPK": 800,
+  "ADA_LOSS_WEIGHT": 0.1,
+  "ADA_MASK_WEIGHT": 10,
+  "ADA_TOPK_WEIGHT": 0.0001
+}
