@@ -103,6 +103,7 @@ def main():
     
     tokenizer = load_tokenizer(model_args.tokenizer_dir, train_mode=model_args.do_train)
     model = load_model(model_args, quant_config, peft_config, AdaVocabLlamaForCausalLM)
+    ADA_TOPK = model.config.ADA_TOPK
     logger.info(f"Model Architecture:\n{model}")
     print_trainable_parameters(model)
     

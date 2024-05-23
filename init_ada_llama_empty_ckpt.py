@@ -21,7 +21,7 @@ if __name__ == '__main__':
     model_name = os.path.basename(os.path.normpath(model_path))
     # Extract the file name from the path
     config_name = os.path.splitext(os.path.basename(config_file))[0]
-
+    # TODO: Change to yaml
     with open(config_file, 'r') as f:
         ada_config = json.load(f)
 
