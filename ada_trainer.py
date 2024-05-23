@@ -69,7 +69,6 @@ class AdaTrainer(Trainer):
                 self._total_loss_scalar_dict[loss_key] += tr_loss_scalar_dict[loss_key]
             logs["learning_rate"] = self._get_learning_rate()
 
-            # self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
 
@@ -368,6 +367,7 @@ class AdaTrainer(Trainer):
         self.state.is_world_process_zero = self.is_world_process_zero()
 
         # tr_loss is a tensor to avoid synchronization of TPUs through .item()
+        # tr_loss --> tr_loss_dict
         tr_loss_dict = {'loss': torch.tensor(0.0).to(args.device), 'lm_loss':torch.tensor(0.0).to(args.device),
                         'topk_loss': torch.tensor(0.0).to(args.device), 'mask_loss':torch.tensor(0.0).to(args.device)}
 
@@ -566,10 +566,9 @@ class AdaTrainer(Trainer):
             self._load_best_model()
 
         # add remaining tr_loss
-        
         train_loss_dict = {}
         for loss_key in self._total_loss_scalar_dict.keys(): 
-            self._total_loss_scalar += tr_loss_dict[loss_key].item()
+            self._total_loss_scalar_dict[loss_key] += tr_loss_dict[loss_key].item()
             train_loss_dict[loss_key] = self._total_loss_scalar_dict[loss_key] / self.state.global_step
 
         metrics = speed_metrics(

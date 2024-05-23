@@ -111,13 +111,27 @@ def main():
         Sum the metrics of all batches and return the average.
         eval_preds.shape: (num_batch, ) * num of metrics
         """
-        token_accuracy, mask_hit_rate, top_k_diff, lm_loss, mask_loss, topk_loss = eval_preds.predictions
+        (token_accuracy, 
+        mask_hit_rate, 
+        top_k_diff, 
+        mask_top_1_hit_rate, 
+        mask_top_5_hit_rate,
+        mask_top_10_hit_rate,
+        mask_top_20_hit_rate,
+        lm_loss, 
+        mask_loss, 
+        topk_loss) = eval_preds.predictions
         return {'token_accuracy': token_accuracy.mean().item(), 
                 'mask_hit_rate': mask_hit_rate.mean().item(), 
                 'top_k_diff': top_k_diff.mean().item(),
+                'mask_top_1_hit_rate': mask_top_1_hit_rate.mean().item(),
+                'mask_top_5_hit_rate': mask_top_5_hit_rate.mean().item(),
+                'mask_top_10_hit_rate': mask_top_10_hit_rate.mean().item(),
+                'mask_top_20_hit_rate': mask_top_20_hit_rate.mean().item(), 
                 'lm_loss': lm_loss.mean().item(),
                 'mask_loss': mask_loss.mean().item(),
-                'topk_loss': topk_loss.mean().item()}
+                'topk_loss': topk_loss.mean().item(),
+                }
     
     def get_topk_logits(logits, topk):
         # logits: (bs * seq_len, vocab_size)
@@ -131,13 +145,13 @@ def main():
         topk_logits.scatter_(1, topk_indices, ones)
         return topk_logits
     
-    def get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_topk):
+    def get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_topk, top_k):
         product = lm_head_logits_topk * ada_logits_topk
 
         # count the number of 1s at each position
         # sum along the vocab_size dimension and keep the dimension unchanged
         hit_count_tensor = product.sum(dim=-1, keepdim=True)  
-        hit_rate_tensor = hit_count_tensor / ADA_TOPK
+        hit_rate_tensor = hit_count_tensor / top_k
         
         return hit_rate_tensor.mean()
     
@@ -183,12 +197,29 @@ def main():
         token_accuracy = None # SHIFT token_level
         mask_hit_rate = None   # token_level
         top_k_diff = None   #  token_level
+        mask_top_1_hit_rate = None # token_level    
         
         # mask_hit_rate
         ada_logits_topk = get_topk_logits(ada_logits.view(bs * seq_len, vocab_size), ADA_TOPK) # (bs * seq_len, vocab_size)
         lm_head_logits_topk = get_topk_logits(lm_head_logits.view(bs * seq_len, vocab_size), ADA_TOPK) # (bs * seq_len, vocab_size) ,  torch.unique(lm_head_logits_topk): tensor([0., 1.], device='cuda:0')
-        mask_hit_rate = get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_topk) # token_level
+        mask_hit_rate = get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_topk, ADA_TOPK) # token_level
 
+        # top_1_hit_rate
+        lm_head_logits_top1 = get_topk_logits(lm_head_logits.view(bs * seq_len, vocab_size), 1)
+        mask_top_1_hit_rate = get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_top1, top_k=1)
+        
+        # top_5_hit_rate
+        lm_head_logits_top5 = get_topk_logits(lm_head_logits.view(bs * seq_len, vocab_size), 5)
+        mask_top_5_hit_rate = get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_top5, top_k=5)
+        
+        # top_10_hit_rate
+        lm_head_logits_top10 = get_topk_logits(lm_head_logits.view(bs * seq_len, vocab_size), 10)
+        mask_top_10_hit_rate = get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_top10, top_k=10)
+        
+        # top_20_hit_rate
+        lm_head_logits_top20 = get_topk_logits(lm_head_logits.view(bs * seq_len, vocab_size), 20)
+        mask_top_20_hit_rate = get_token_level_mask_hit_rate(ada_logits_topk, lm_head_logits_top20, top_k=20)
+        
         # top_k_diff
         top_k_diff = count_token_level_positive(ada_logits.view(bs * seq_len, vocab_size)) - ADA_TOPK # token_level
         
@@ -198,7 +229,16 @@ def main():
         shift_labels = labels[..., 1:].contiguous().view(-1)
         token_accuracy = calculate_token_accuracy(shift_labels, shift_logits_argmax)
         
-        return (token_accuracy, mask_hit_rate, top_k_diff, lm_loss, mask_loss, topk_loss)
+        return (token_accuracy, 
+                mask_hit_rate, 
+                top_k_diff, 
+                mask_top_1_hit_rate, 
+                mask_top_5_hit_rate,
+                mask_top_10_hit_rate,
+                mask_top_20_hit_rate,
+                lm_loss, 
+                mask_loss, 
+                topk_loss)
     
     trainer = AdaTrainer(
         model=model,

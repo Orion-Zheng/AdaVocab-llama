@@ -13,11 +13,12 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaPreTrained
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-# TODO: set and get these hyperparameters from ENV or config file
+# TODO: set and get these hyperparameters from arguments so that they can be recorded by wandb
 ADA_RATIO = 4
-ADA_TOPK = 200
-ADA_LOSS_WEIGHT = 0.1 # lm_loss: 10.375   mask_loss: 0.6931
-ADA_TOPK_WEIGHT = 0.00000005 # topk_loss: 32727040
+ADA_TOPK = 800
+ADA_LOSS_WEIGHT = 0.1 # lm_loss: 10.375   
+ADA_MASK_WEIGHT = 10 # mask_loss: 0.6931
+ADA_TOPK_WEIGHT = 0.0001
 
 @dataclass
 class AdaCausalLMOutputWithPast(CausalLMOutputWithPast):
@@ -162,9 +163,10 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
             # TODO: Pad Token Handle
             target_ones = batch_size * seq_len * self.topK  # scalar  
             target_ones = torch.tensor(target_ones, dtype=torch.float32).to(ada_ones.device)
-            topk_loss = F.l1_loss(ada_ones, target_ones)
+            # Andy: we need to normalize this loss, make it agnostic to batch size, seq_len, topK
+            topk_loss = F.l1_loss(ada_ones, target_ones) / (batch_size * seq_len) 
 
-            loss = ADA_LOSS_WEIGHT * lm_loss + mask_loss + ADA_TOPK_WEIGHT * topk_loss
+            loss = ADA_LOSS_WEIGHT * lm_loss + ADA_MASK_WEIGHT * mask_loss + ADA_TOPK_WEIGHT * topk_loss
 
         if not return_dict:
             output = (ada_logits,) + outputs[1:]
@@ -178,9 +180,9 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
             attentions=outputs.attentions,
             # New added
             lm_head_logits=lm_head_logits,
-            lm_loss=lm_loss,
-            mask_loss=mask_loss,
-            topk_loss=topk_loss,
+            lm_loss=ADA_LOSS_WEIGHT * lm_loss,
+            mask_loss=ADA_MASK_WEIGHT * mask_loss,
+            topk_loss=ADA_TOPK_WEIGHT * topk_loss,
         )
 
     def get_input_embeddings(self):
