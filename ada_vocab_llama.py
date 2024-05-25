@@ -13,7 +13,7 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaPreTrained
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-from codebase.utils import GlobalConfig
+# from codebase.utils import GlobalConfig
 
 # TODO: set and get these hyperparameters from arguments so that they can be recorded by wandb
 # ADA_RATIO = 4
@@ -21,13 +21,6 @@ from codebase.utils import GlobalConfig
 # ADA_LOSS_WEIGHT = 0.1 # lm_loss: 10.375   
 # ADA_MASK_WEIGHT = 10 # mask_loss: 0.6931
 # ADA_TOPK_WEIGHT = 0.0001
-
-# config = GlobalConfig.get_config()
-# # ADA_RATIO = config['ADA_RATIO']
-# ADA_TOPK = config['ADA_TOPK']
-# ADA_LOSS_WEIGHT = config['ADA_LOSS_WEIGHT']
-# ADA_MASK_WEIGHT = config['ADA_MASK_WEIGHT']
-# ADA_TOPK_WEIGHT = config['ADA_TOPK_WEIGHT']
 
 @dataclass
 class AdaCausalLMOutputWithPast(CausalLMOutputWithPast):
@@ -40,18 +33,22 @@ class AdaCausalLMOutputWithPast(CausalLMOutputWithPast):
     topk_loss: Optional[torch.FloatTensor] = None
 
 
-class AdaVocabHead(nn.Module):  # The same as LoRALayer
-    def __init__(self, hidden_size, vocab_size, sub_vocab_dim):
+class AdaVocabHead(nn.Module):  # Basically the same as LoRALayer, ecxept the activation function
+    def __init__(self, hidden_size, vocab_size, sub_vocab_dim, activation_func=None):
         super().__init__()
         std_dev = 1 / torch.sqrt(torch.tensor(sub_vocab_dim).float())
         # TODO: Consider adding non-linear activation function
         # TODO: Investigate the rationale of parameter initialization  Tingyuan: Maybe consider using random initialization with low variance
         self.A = nn.Parameter(torch.randn(hidden_size, sub_vocab_dim) * std_dev)
         self.B = nn.Parameter(torch.zeros(sub_vocab_dim, vocab_size))
+        self.activation_func = activation_func
 
     def forward(self, x):
         # x.shape: (..., hidden_size), A.shape: (hidden_size, sub_vocab_dim), B.shape: (sub_vocab_dim, vocab_size)
-        ada_vocab_logits = x @ self.A @ self.B  # ada_vocab_logits.shape: (..., vocab_size)
+        logits = x @ self.A
+        if self.activation_func is not None:
+            logits = self.activation_func(logits)
+        ada_vocab_logits = logits @ self.B  # ada_vocab_logits.shape: (..., vocab_size)
         return ada_vocab_logits
 
     
@@ -61,19 +58,16 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
 
     def __init__(self, config):
         super().__init__(config)
-        self.sub_vocab_dim = config.hidden_size //config.ADA_RATIO  
-        self.topK = config.ADA_TOPK
-
-        # Only useful in training
-        self.ADA_LOSS_WEIGHT = config.ADA_LOSS_WEIGHT
-        self.ADA_MASK_WEIGHT = config.ADA_MASK_WEIGHT
-        self.ADA_TOPK_WEIGHT = config.ADA_TOPK_WEIGHT
-        
+        self.sub_vocab_dim = config.hidden_size // config.ADA_RATIO  
+        act_func = None
+        if config.ADA_ACT:
+            act_func = torch.nn.GELU()
         # AdaVocabHead is already initialized with random weights, 
         # so no need to use `self.post_init` method after this
         self.adavocab_head = AdaVocabHead(config.hidden_size, 
                                           config.vocab_size, 
-                                          self.sub_vocab_dim)
+                                          self.sub_vocab_dim,
+                                          activation_func=act_func)
         self.freeze_original_model()
     
     def freeze_original_model(self):
@@ -87,7 +81,7 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
 
     def topk_mask(self, logits):
         # logits.shape: (batch_size, seq_len, vocab_size)
-        topk_values, topk_indices = torch.topk(logits, self.topK, dim=-1)
+        topk_values, topk_indices = torch.topk(logits, self.config.ADA_TOPK, dim=-1)
         # topk_values.shape, topk_indices.shape: (batch_size, seq_len, topK)
         mask = torch.zeros_like(logits)  # (batch_size, seq_len, vocab_size)
         # Only in top-k positions, put 1 to the corresponding position
@@ -176,12 +170,12 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
 
             ada_ones = ada_probs.sum()  # scalar
             # TODO: Pad Token Handle
-            target_ones = batch_size * seq_len * self.topK  # scalar  
+            target_ones = batch_size * seq_len * self.config.ADA_TOPK # scalar  
             target_ones = torch.tensor(target_ones, dtype=torch.float32).to(ada_ones.device)
             # Andy: we need to normalize this loss, make it agnostic to batch size, seq_len, topK
             topk_loss = F.l1_loss(ada_ones, target_ones) / (batch_size * seq_len) 
 
-            loss = self.ADA_LOSS_WEIGHT * lm_loss + self.ADA_MASK_WEIGHT * mask_loss + self.ADA_TOPK_WEIGHT * topk_loss
+            loss = self.config.ADA_LOSS_WEIGHT * lm_loss + self.config.ADA_MASK_WEIGHT * mask_loss + self.config.ADA_TOPK_WEIGHT * topk_loss
 
         if not return_dict:
             output = (ada_logits,) + outputs[1:]
@@ -195,9 +189,9 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
             attentions=outputs.attentions,
             # New added
             lm_head_logits=lm_head_logits if lm_head_logits is not None else None,
-            lm_loss=self.ADA_LOSS_WEIGHT * lm_loss if lm_loss is not None else None,
-            mask_loss=self.ADA_MASK_WEIGHT * mask_loss if mask_loss is not None else None,
-            topk_loss=self.ADA_TOPK_WEIGHT * topk_loss if topk_loss is not None else None,
+            lm_loss=self.config.ADA_LOSS_WEIGHT * lm_loss if lm_loss is not None else None,
+            mask_loss=self.config.ADA_MASK_WEIGHT * mask_loss if mask_loss is not None else None,
+            topk_loss=self.config.ADA_TOPK_WEIGHT * topk_loss if topk_loss is not None else None,
         )
 
     def get_input_embeddings(self):

@@ -16,13 +16,13 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_dataset, load_from_disk, load_metric
 from accelerate import Accelerator, init_empty_weights
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union, Sequence
 from transformers.integrations.integration_utils import WandbCallback
 from datetime import datetime, timedelta
 
 from codebase.monkey_patch import new_wandb_on_train_end, SafeSavingCallback_NSCC
-from codebase.utils import print_trainable_parameters, load_tokenizer, prepare_for_train, enable_flash_attn
+from codebase.utils import print_trainable_parameters, load_tokenizer, prepare_for_train, enable_flash_attn, set_model_config
 from codebase.args_parser import parse_args
 from codebase.dist_logging import get_dist_logger
 
@@ -40,7 +40,16 @@ IGNORE_INDEX = -100
 SAFE_MINUTES = 5
 
 SafeSavingCallback_NSCC.safe_minutes = SAFE_MINUTES
-    
+
+@dataclass
+class AdaVocabArgs():
+    ADA_RATIO: int
+    ADA_TOPK: int
+    ADA_LOSS_WEIGHT: float
+    ADA_MASK_WEIGHT: float
+    ADA_TOPK_WEIGHT: float
+    ADA_ACT: bool = False
+
 @dataclass
 class PaddToMaxLenCollator(object):
     # Adapt from: https://github.com/ymcui/Chinese-LLaMA-Alpaca/blob/6e8c6c23e51ec8f0cf8a2b1f1633e52edb768e9c/scripts/training/build_dataset.py
@@ -59,9 +68,10 @@ class PaddToMaxLenCollator(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-def load_model(model_args, quant_config=None, peft_config=None, model_class=AutoModelForCausalLM):
+def load_model(model_args, quant_config=None, peft_config=None, model_config=None, model_class=AutoModelForCausalLM):
     kwargs = {
-        "torch_dtype": eval(f"torch.{model_args.load_dtype}")
+        "torch_dtype": eval(f"torch.{model_args.load_dtype}"),
+        "config": model_config  # e.g. you want to reuse the ckpt but change the config
     }
     if quant_config is not None:
         kwargs["quantization_config"] = quant_config
@@ -87,8 +97,8 @@ def enable_monkey_patch():
 
 def main():
     enable_monkey_patch() 
-    
-    model_args, data_args, trainer_config, peft_config, quant_config, log_args = parse_args()
+    custom_args = [AdaVocabArgs]
+    model_args, data_args, trainer_config, peft_config, quant_config, log_args, other_args = parse_args(*custom_args)
     # TODO: add option to not using eval data(considering training arguments)
     logger.info("Load Training Dataset ...")
     train_data = load_from_disk(data_args.train_data_dir)
@@ -102,8 +112,17 @@ def main():
     logger.info(f"Evaluation Data:\n{eval_data}")
     
     tokenizer = load_tokenizer(model_args.tokenizer_dir, train_mode=model_args.do_train)
-    model = load_model(model_args, quant_config, peft_config, AdaVocabLlamaForCausalLM)
-    ADA_TOPK = model.config.ADA_TOPK
+    
+    # == Add AdaVocab HyperParam to model config before loading model ==
+    model_config = AutoConfig.from_pretrained(model_args.model_dir)
+    ada_config_dict = asdict(other_args[0])
+    model_config = set_model_config(model_config, ada_config_dict)
+    ADA_TOPK = model_config.ADA_TOPK
+    logger.info(f"Final Model Config:\n{model_config}")
+    # ===================================================================
+    
+    model = load_model(model_args, quant_config, peft_config, model_config, AdaVocabLlamaForCausalLM)
+    
     logger.info(f"Model Architecture:\n{model}")
     print_trainable_parameters(model)
     
@@ -247,8 +266,8 @@ def main():
         eval_dataset=eval_data, 
         args=trainer_config,
         data_collator=PaddToMaxLenCollator(tokenizer, model_args.max_length), 
-        compute_metrics=compute_metrics, # Tingyuan
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics   # Tingyuan
+        compute_metrics=compute_metrics, 
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics   
         # callbacks=[SafeSavingCallback_NSCC]  # only for for PBS Pro Cluster(e.g. NSCC)
     )
     

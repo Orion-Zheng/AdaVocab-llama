@@ -26,7 +26,7 @@ if __name__ == '__main__':
         ada_config = json.load(f)
 
     config = AutoConfig.from_pretrained(model_path)
-    set_model_config(config, ada_config)
+    config = set_model_config(config, ada_config)
 
     output_path = os.path.join(output_dir, f'ada-{model_name}-empty_{config_name}')
     if os.path.exists(output_path):
