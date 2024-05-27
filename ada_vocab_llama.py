@@ -68,6 +68,7 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
                                           config.vocab_size, 
                                           self.sub_vocab_dim,
                                           activation_func=act_func)
+
         self.freeze_original_model()
     
     def freeze_original_model(self):
@@ -78,6 +79,10 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
             param.requires_grad = False
         for param in self.adavocab_head.parameters():
             param.requires_grad = True
+    
+    def offload_lm_head(self):
+        self.lm_head.to('cpu')
+        
 
     def topk_mask(self, logits):
         # logits.shape: (batch_size, seq_len, vocab_size)
@@ -124,6 +129,7 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
 
         hidden_states = outputs[0]  # hidden_states.shape: (batch_size, seq_len, hidden_size)
         batch_size, seq_len, _ = hidden_states.size()
+        vocab_size = self.lm_head.weight.shape[0]
        
         # This activation could be very large during training if vocab_size is large,
         # but in inference, storing activation is not needed
@@ -176,6 +182,33 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
             topk_loss = F.l1_loss(ada_ones, target_ones) / (batch_size * seq_len) 
 
             loss = self.config.ADA_LOSS_WEIGHT * lm_loss + self.config.ADA_MASK_WEIGHT * mask_loss + self.config.ADA_TOPK_WEIGHT * topk_loss
+        
+        if not self.training:
+            
+            ada_topk_probs, ada_index = torch.topk(ada_logits, dim = -1, k = self.config.ADA_TOPK)
+            # del ada_logits
+            ada_index_slice = ada_index[:, -1, :]
+            union_ada_index_slice = torch.unique(ada_index_slice).to('cpu')   # torch_size([union_size])
+                 
+            sliced_lm_head_weight = self.lm_head.weight[union_ada_index_slice, :]  # torch.Size([union_size, 2048])
+            self.sliced_lm_head = nn.Linear(in_features=sliced_lm_head_weight.shape[1], out_features=sliced_lm_head_weight.shape[0])
+            
+            with torch.no_grad(): # No gradient update required
+                self.sliced_lm_head.weight.copy_(sliced_lm_head_weight)  
+            # del sliced_lm_head_weight
+            self.sliced_lm_head.to('cuda:0')
+            ada_logits_sliced = self.sliced_lm_head(hidden_states)  
+            
+            
+            # Create a tensor of all 0s with shape [bs, len, max_dim]
+            ada_logits_fill_dim = torch.zeros((batch_size, seq_len, vocab_size), dtype=ada_logits_sliced.dtype, device=ada_logits_sliced.device)
+
+            # Use union_ada_index_slice for filling
+            # Assign the value of ada_logits to the specified location of ada_logits_fill_dim through broadcasting
+            ada_logits_fill_dim.scatter_(2, union_ada_index_slice.expand(batch_size, seq_len, -1).to('cuda:0'), ada_logits_sliced)
+            #The ada_logits_fill_dim here is actually the real logits
+            ada_logits = ada_logits_fill_dim
+            
 
         if not return_dict:
             output = (ada_logits,) + outputs[1:]
