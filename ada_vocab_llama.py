@@ -196,7 +196,7 @@ class AdaVocabLlamaForCausalLM(LlamaForCausalLM):  # For Training(train with LM 
             with torch.no_grad(): # No gradient update required
                 self.sliced_lm_head.weight.copy_(sliced_lm_head_weight)  
             # del sliced_lm_head_weight
-            self.sliced_lm_head.to('cuda:0')
+            self.sliced_lm_head.to(input_ids.device)
             ada_logits_sliced = self.sliced_lm_head(hidden_states)  
             
             
