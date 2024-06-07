@@ -13,15 +13,6 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaPreTrained
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-# from codebase.utils import GlobalConfig
-
-# TODO: set and get these hyperparameters from arguments so that they can be recorded by wandb
-# ADA_RATIO = 4
-# ADA_TOPK = 800
-# ADA_LOSS_WEIGHT = 0.1 # lm_loss: 10.375   
-# ADA_MASK_WEIGHT = 10 # mask_loss: 0.6931
-# ADA_TOPK_WEIGHT = 0.0001
-
 @dataclass
 class AdaCausalLMOutputWithPast(CausalLMOutputWithPast):
     # keep original `loss` for `training_step` and `predictions_step`, 

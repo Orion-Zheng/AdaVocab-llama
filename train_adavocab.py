@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union, S
 from transformers.integrations.integration_utils import WandbCallback
 from datetime import datetime, timedelta
 
-from codebase.monkey_patch import new_wandb_on_train_end, SafeSavingCallback_NSCC
+from codebase.monkey_patch import new_wandb_on_train_end, SafeSavingCallback
 from codebase.utils import print_trainable_parameters, load_tokenizer, prepare_for_train, enable_flash_attn, set_model_config
 from codebase.args_parser import parse_args
 from codebase.dist_logging import get_dist_logger
@@ -39,7 +39,7 @@ os.environ['WANDB_LOG_MODEL'] = 'true'
 IGNORE_INDEX = -100
 SAFE_MINUTES = 5
 
-SafeSavingCallback_NSCC.safe_minutes = SAFE_MINUTES
+SafeSavingCallback.safe_minutes = SAFE_MINUTES
 
 @dataclass
 class AdaVocabArgs():
@@ -267,8 +267,8 @@ def main():
         args=trainer_config,
         data_collator=PaddToMaxLenCollator(tokenizer, model_args.max_length), 
         compute_metrics=compute_metrics, 
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics   
-        # callbacks=[SafeSavingCallback_NSCC]  # only for for PBS Pro Cluster(e.g. NSCC)
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics, 
+        callbacks=[SafeSavingCallback]  # Add SafeSavingCallback to save model when time is running out
     )
     
     # Training
