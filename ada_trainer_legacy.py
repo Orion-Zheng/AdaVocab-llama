@@ -10,11 +10,10 @@ except:
 from transformers.trainer import (logger, has_length, math, sys, DebugOption,
                                   is_sagemaker_mp_enabled, os, TrainerState,
                                   deepspeed_load_checkpoint, deepspeed_init, DebugUnderflowOverflow,
-                                  DebugOption, shutil, speed_metrics, dist,
-                                  ParallelMode, is_torch_xla_available, skip_first_batches,
-                                  hp_params, HPSearchBackend, TRAINER_STATE_NAME,
-                                  _is_peft_model, tpu_spmd_dataloader, ExportableState,
-                                  is_accelerate_available, DistributedType,
+                                  DebugOption, TrainOutput, shutil, speed_metrics, dist,
+                                  ParallelMode, is_torch_tpu_available, skip_first_batches,
+                                  SeedableRandomSampler, version, accelerate_version, RandomSampler,
+                                  get_dataloader_sampler, hp_params, HPSearchBackend, TRAINER_STATE_NAME,
                                   time, get_model_param_count, np)
         
 
@@ -25,9 +24,15 @@ class TrainOutputMulti(NamedTuple):
 
 # Customized for training adaVocab heads
 class AdaTrainer(Trainer):
-    # Compatible with transformers v4.41.2
-    def compute_loss(self, model, inputs, return_outputs=False):
+    # Compatible with transformers v4.37.2
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+    ):
         """
+        # TODO: check multi-GPU setting.
         Compute the training loss for the model.
 
         Args:
@@ -45,16 +50,15 @@ class AdaTrainer(Trainer):
         # In `prediction_step`, `return_outputs=True` --> return `loss`` and `outputs`(logits, hidden_states, ...)
         # loss = {'loss': loss, 'lm_loss': outputs.lm_loss, 'mask_loss': outputs.mask_loss, 'topk_loss': outputs.topk_loss}
         return (loss, outputs) if return_outputs else loss
-
-    def _maybe_log_save_evaluate(self, tr_loss_dict, grad_norm, model, trial, epoch, ignore_keys_for_eval):
+    
+    def _maybe_log_save_evaluate(self, tr_loss_dict, model, trial, epoch, ignore_keys_for_eval):
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
-            if is_torch_xla_available():
+            if is_torch_tpu_available():
                 xm.mark_step()
 
             logs: Dict[str, float] = {}
-        
-            # all_gather + mean() to get average loss over all processes
             tr_loss_scalar_dict = {}
+            # all_gather + mean() to get average loss over all processes
             for loss_key in tr_loss_dict.keys():
                 tr_loss_scalar_dict[loss_key] = self._nested_gather(tr_loss_dict[loss_key]).mean().item()
 
@@ -63,9 +67,6 @@ class AdaTrainer(Trainer):
 
                 logs[loss_key] = round(tr_loss_scalar_dict[loss_key] / (self.state.global_step - self._globalstep_last_logged), 4)
                 self._total_loss_scalar_dict[loss_key] += tr_loss_scalar_dict[loss_key]
-            
-            if grad_norm is not None:
-                logs["grad_norm"] = grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             logs["learning_rate"] = self._get_learning_rate()
 
             self._globalstep_last_logged = self.state.global_step
@@ -88,7 +89,7 @@ class AdaTrainer(Trainer):
         if self.control.should_save:
             self._save_checkpoint(model, trial, metrics=metrics)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
-
+            
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -117,9 +118,6 @@ class AdaTrainer(Trainer):
         with self.compute_loss_context_manager():
             loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
 
-        del inputs
-        torch.cuda.empty_cache()
-
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
@@ -133,7 +131,7 @@ class AdaTrainer(Trainer):
                 'lm_loss': outputs.lm_loss.detach() / self.args.gradient_accumulation_steps,
                 'mask_loss': outputs.mask_loss.detach() / self.args.gradient_accumulation_steps,
                 'topk_loss': outputs.topk_loss.detach() / self.args.gradient_accumulation_steps}
-
+    
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
@@ -157,8 +155,6 @@ class AdaTrainer(Trainer):
         logger.debug(f"Currently training with a batch size of: {self._train_batch_size}")
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
-        if self.is_fsdp_xla_v2_enabled:
-            train_dataloader = tpu_spmd_dataloader(train_dataloader)
 
         # Setting up training control variables:
         # number of training epochs: num_train_epochs
@@ -230,11 +226,7 @@ class AdaTrainer(Trainer):
         if not delay_optimizer_creation:
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
-        self.state = TrainerState(
-            stateful_callbacks=[
-                cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
-            ]
-        )
+        self.state = TrainerState()
         self.state.is_hyper_param_search = trial is not None
         self.state.train_batch_size = self._train_batch_size
 
@@ -272,9 +264,6 @@ class AdaTrainer(Trainer):
         use_accelerator_prepare = True if model is self.model else False
 
         if delay_optimizer_creation:
-            if use_accelerator_prepare:
-                self._fsdp_qlora_plugin_updates()
-                self.model = self.accelerator.prepare(self.model)
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
         # prepare using `accelerator` prepare
@@ -305,9 +294,7 @@ class AdaTrainer(Trainer):
         # ckpt loading
         if resume_from_checkpoint is not None:
             if self.is_deepspeed_enabled:
-                deepspeed_load_checkpoint(
-                    self.model_wrapped, resume_from_checkpoint, load_module_strict=not _is_peft_model(self.model)
-                )
+                deepspeed_load_checkpoint(self.model_wrapped, resume_from_checkpoint)
             elif is_sagemaker_mp_enabled() or self.is_fsdp_enabled:
                 self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
 
@@ -342,8 +329,6 @@ class AdaTrainer(Trainer):
             os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
         ):
             self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
-            self.compare_trainer_and_checkpoint_args(self.args, self.state)
-            self._load_callback_state()
             epochs_trained = self.state.global_step // num_update_steps_per_epoch
             if not args.ignore_data_skip:
                 steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
@@ -385,13 +370,31 @@ class AdaTrainer(Trainer):
         # tr_loss --> tr_loss_dict
         tr_loss_dict = {'loss': torch.tensor(0.0).to(args.device), 'lm_loss':torch.tensor(0.0).to(args.device),
                         'topk_loss': torch.tensor(0.0).to(args.device), 'mask_loss':torch.tensor(0.0).to(args.device)}
+
         # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar_dict =  {'loss': 0.0, 'lm_loss': 0.0, 'topk_loss': 0.0, 'mask_loss': 0.0}
         self._globalstep_last_logged = self.state.global_step
         model.zero_grad()
-        grad_norm: Optional[float] = None
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+
+        # Skip the first epochs_trained epochs to get the random state of the dataloader at the right point.
+        if not args.ignore_data_skip:
+            for epoch in range(epochs_trained):
+                sampler = get_dataloader_sampler(train_dataloader)
+                sampler_kinds = [RandomSampler]
+                if version.parse(accelerate_version) > version.parse("0.23.0"):
+                    sampler_kinds.append(SeedableRandomSampler)
+                is_random_sampler = isinstance(sampler, tuple(sampler_kinds))
+                if not is_random_sampler:
+                    # We just need to begin an iteration to create the randomization of the sampler.
+                    for _ in train_dataloader:
+                        break
+                else:
+                    # Otherwise we need to call the whooooole sampler cause there is some random operation added
+                    # AT THE VERY END!
+                    sampler = sampler if sampler is not None else []
+                    _ = list(sampler)
 
         total_batched_samples = 0
         for epoch in range(epochs_trained, num_train_epochs):
@@ -434,12 +437,7 @@ class AdaTrainer(Trainer):
                             "a `main_input_name` attribute to the model class you are using."
                         )
                     else:
-                        input_device = inputs[main_input_name].device
-                        self.state.num_input_tokens_seen += torch.sum(
-                            self.accelerator.gather(
-                                torch.tensor(inputs[main_input_name].numel(), device=input_device, dtype=torch.int64)
-                            )
-                        ).item()
+                        self.state.num_input_tokens_seen += self.accelerator.gather(inputs[main_input_name]).numel()
                 if rng_to_sync:
                     self._load_rng_state(resume_from_checkpoint)
                     rng_to_sync = False
@@ -466,16 +464,12 @@ class AdaTrainer(Trainer):
                     tr_loss_step = tr_loss_step_dict[loss_key]
                     if (
                         args.logging_nan_inf_filter
-                        and not is_torch_xla_available()
+                        and not is_torch_tpu_available()
                         and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
                     ):
                         # if loss is nan or inf simply add the average of previous logged losses
                         tr_loss_dict[loss_key] += tr_loss_dict[loss_key] / (1 + self.state.global_step - self._globalstep_last_logged)
                     else:
-                        if tr_loss_dict[loss_key].device != tr_loss_step.device:
-                            raise ValueError(
-                                f"Calculated loss must be on the original device: {tr_loss_dict[loss_key].device} but device in use is {tr_loss_step.device}"
-                            )
                         tr_loss_dict[loss_key] += tr_loss_step
 
                 self.current_flos += float(self.floating_point_ops(inputs))
@@ -500,29 +494,18 @@ class AdaTrainer(Trainer):
                         # deepspeed does its own clipping
 
                         if is_sagemaker_mp_enabled() and args.fp16:
-                            _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
+                            self.optimizer.clip_master_grads(args.max_grad_norm)
                         elif self.use_apex:
                             # Revert to normal clipping otherwise, handling Apex or full precision
-                            _grad_norm = nn.utils.clip_grad_norm_(
+                            nn.utils.clip_grad_norm_(
                                 amp.master_params(self.optimizer),
                                 args.max_grad_norm,
                             )
                         else:
-                            _grad_norm = self.accelerator.clip_grad_norm_(
+                            self.accelerator.clip_grad_norm_(
                                 model.parameters(),
                                 args.max_grad_norm,
                             )
-
-                        if (
-                            is_accelerate_available()
-                            and self.accelerator.distributed_type == DistributedType.DEEPSPEED
-                        ):
-                            grad_norm = model.get_global_grad_norm()
-                            # In some cases the grad norm may not return a float
-                            if hasattr(grad_norm, "item"):
-                                grad_norm = grad_norm.item()
-                        else:
-                            grad_norm = _grad_norm
 
                     # Optimizer step
                     self.optimizer.step()
@@ -537,7 +520,7 @@ class AdaTrainer(Trainer):
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(tr_loss_dict, grad_norm, model, trial, epoch, ignore_keys_for_eval)
+                    self._maybe_log_save_evaluate(tr_loss_dict, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -555,7 +538,7 @@ class AdaTrainer(Trainer):
             self._maybe_log_save_evaluate(tr_loss_dict, model, trial, epoch, ignore_keys_for_eval)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
-                if is_torch_xla_available():
+                if is_torch_tpu_available():
                     # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
                     xm.master_print(met.metrics_report())
                 else:
@@ -573,7 +556,7 @@ class AdaTrainer(Trainer):
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         if args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
             # Wait for everyone to get here so we are sure the model has been saved by process 0.
-            if is_torch_xla_available():
+            if is_torch_tpu_available():
                 xm.rendezvous("load_best_model_at_end")
             elif args.parallel_mode == ParallelMode.DISTRIBUTED:
                 dist.barrier()
@@ -586,8 +569,7 @@ class AdaTrainer(Trainer):
         train_loss_dict = {}
         for loss_key in self._total_loss_scalar_dict.keys(): 
             self._total_loss_scalar_dict[loss_key] += tr_loss_dict[loss_key].item()
-            effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
-            train_loss_dict[loss_key] = self._total_loss_scalar_dict[loss_key] / effective_global_step
+            train_loss_dict[loss_key] = self._total_loss_scalar_dict[loss_key] / self.state.global_step
 
         metrics = speed_metrics(
             "train",

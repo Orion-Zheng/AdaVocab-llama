@@ -1,5 +1,5 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from adavocab_llama.ada_vocab_llama import AdaVocabLlamaForCausalLM
+from adavocab_llama.ada_vocab_factory import AdaVocabLlamaForCausalLM
 import warnings
 warnings.filterwarnings("ignore")
 

@@ -26,7 +26,7 @@ from codebase.utils import print_trainable_parameters, load_tokenizer, prepare_f
 from codebase.args_parser import parse_args
 from codebase.dist_logging import get_dist_logger
 
-from adavocab_llama.ada_vocab_llama import AdaVocabLlamaForCausalLM, AdaCausalLMOutputWithPast
+from adavocab_llama.ada_vocab_factory import AdaVocabLlamaForCausalLM, AdaVocabGemmaforCausalLM, AdaVocabQwen2ForCausalLM
 from adavocab_llama.ada_trainer import AdaTrainer
 # can skip if you have already logged in at console by 'wandb login'
 # import wandb
@@ -121,7 +121,7 @@ def main():
     logger.info(f"Final Model Config:\n{model_config}")
     # ===================================================================
     
-    model = load_model(model_args, quant_config, peft_config, model_config, AdaVocabLlamaForCausalLM)
+    model = load_model(model_args, quant_config, peft_config, model_config, AdaVocabQwen2ForCausalLM)
     
     logger.info(f"Model Architecture:\n{model}")
     print_trainable_parameters(model)
