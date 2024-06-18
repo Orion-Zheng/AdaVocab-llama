@@ -43,12 +43,14 @@ SafeSavingCallback.safe_minutes = SAFE_MINUTES
 
 @dataclass
 class AdaVocabArgs():
-    ADA_RATIO: int
+    ADA_DIM: int
     ADA_TOPK: int
     ADA_LOSS_WEIGHT: float
     ADA_MASK_WEIGHT: float
     ADA_TOPK_WEIGHT: float
     ADA_ACT: bool = False
+    ADA_DORA: bool = False
+    ADA_SVD: bool = False
 
 @dataclass
 class PaddToMaxLenCollator(object):

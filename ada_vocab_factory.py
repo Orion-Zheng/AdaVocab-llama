@@ -1,5 +1,7 @@
 import math
 import warnings
+import hashlib
+import os
 from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass
 
@@ -15,6 +17,103 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model, Qwen2PreTrained
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
+from codebase.dist_logging import get_dist_logger
+logger = get_dist_logger()
+
+def svd_with_cache(matrix, cache_dir, max_rank=1024):
+    """
+    SVD with cache mechanism to avoid repeated SVD computation.
+    SVD can be very slow for large matrices, so we cache the results.
+    """
+    in_dim, out_dim = matrix.shape
+    # slice_weight = matrix[::1000, :]  # too sensitive to precision
+    # weight_hash = hashlib.md5(slice_weight.detach().cpu().numpy().tobytes()).hexdigest()
+    weight_hash = in_dim * out_dim  
+    cache_file = os.path.join(cache_dir, f'{weight_hash}.pt')
+
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+
+    if os.path.exists(cache_file):
+        # Load cached SVD results
+        logger.info(f"Loading cached SVD results from {cache_file}")
+        U, S, Vh = torch.load(cache_file)
+    else:
+        # Perform SVD and cache the results
+        logger.info(f'Performing SVD and save to cache {cache_file}')
+        U, S, Vh = torch.linalg.svd(matrix.float())
+        U = U[:, :max_rank].clone()  # Shape: [out_features, rank]
+        S = S[:max_rank].clone()     # Shape: [rank]
+        Vh = Vh[:max_rank, :].clone()  # Shape: [rank, in_features]
+        # Save the SVD results to cache
+        torch.save((U, S, Vh), cache_file)
+    return U, S, Vh
+
+def create_factorized_compression_for_linear(source_linear, rank, svd_cache_dir='experiment_cache/'):
+    """
+    Adapt from: https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/cli_svd.py
+    Create a factorized compression for a given linear layer using SVD.
+    Args:
+        source_linear (nn.Linear): The original linear layer to be compressed.
+        rank (int, optional): The rank for the factorization. If None, it will be calculated based on rank_factor.
+        rank_factor (float, optional): The factor to determine the rank if rank is not provided. Default is 0.3.
+    Returns:
+        nn.Sequential: A sequential container of the compressed linear layers.
+    """
+    logger.info(f"Creating SVD AdaHead with rank {rank}")
+    with torch.no_grad():
+        dtype = source_linear.weight.dtype
+        # Check if the source linear layer has a bias term
+        if hasattr(source_linear, 'bias'):
+            bias = source_linear.bias
+        else:
+            bias = None
+        # Calculate the total number of parameters in the source linear layer
+        source_num_params = sum(param.numel() for param in source_linear.parameters())
+        # Get the weight matrix of the source linear layer
+        source_linear_weight = source_linear.weight.data
+        # Ensure rank is less than the minimum dimension of the weight matrix
+        assert rank < min(source_linear_weight.shape)
+        # Perform SVD on the weight matrix
+        # U, S, Vh = torch.linalg.svd(source_linear_weight.float())
+        U, S, Vh = svd_with_cache(source_linear_weight, svd_cache_dir)
+        # Truncate U, S, Vh to the specified rank
+        U = U[:, :rank].contiguous()  # Shape: [out_features, rank]
+        S = S[:rank].contiguous()     # Shape: [rank]
+        Vh = Vh[:rank, :].contiguous()  # Shape: [rank, in_features]
+        # Incorporate singular values into U
+        U = U @ torch.diag(S)  # Shape: [out_features, rank]
+        # Flatten U and Vh for quantile computation
+        U_flatten = U.flatten()
+        Vh_flatten = Vh.flatten()
+        # Define the maximum quantization size
+        max_quant_size = 2**23
+        # Compute high and low quantile values for clamping
+        if len(U_flatten) + len(Vh_flatten) >= max_quant_size:
+            dist2 = U_flatten[:min(len(U_flatten), max_quant_size)]
+            dist3 = Vh_flatten[:min(len(Vh_flatten), max_quant_size)]
+            hi_val = max(torch.quantile(dist3, 1), torch.quantile(dist2, 1))
+        else:
+            dist = torch.cat([U_flatten, Vh_flatten])
+            hi_val = torch.quantile(dist, 1)
+        low_val = -hi_val
+        # Clamp U and Vh to the quantile values
+        U = U.clamp(low_val, hi_val)
+        Vh = Vh.clamp(low_val, hi_val)
+        # Create the down projection linear layer (Vh)
+        lora_down = nn.Linear(Vh.shape[1], Vh.shape[0], dtype=dtype, bias=False, device=source_linear_weight.device)
+        lora_down.weight.data = Vh.to(device=source_linear_weight.device, dtype=dtype)
+        # Create the up projection linear layer (U)
+        lora_up = nn.Linear(U.shape[1], U.shape[0], dtype=dtype, bias=bias is not None, device=source_linear_weight.device)
+        lora_up.weight.data = U.to(device=source_linear_weight.device, dtype=dtype)
+        # If the original linear layer had a bias, copy it to the up projection layer
+        if bias is not None:
+            lora_up.bias = nn.Parameter(bias.clone())
+        # Print compression ratio (for debugging purposes)
+        #print('compression', sum(param.numel() for param in ret.parameters()) / source_num_params)
+        return lora_down, lora_up
+    
+
 @dataclass
 class AdaCausalLMOutputWithPast(CausalLMOutputWithPast):
     # keep original `loss` for `training_step` and `predictions_step`, 
@@ -26,23 +125,37 @@ class AdaCausalLMOutputWithPast(CausalLMOutputWithPast):
     topk_loss: Optional[torch.FloatTensor] = None
 
 
-class AdaVocabHead(nn.Module):  # Basically the same as LoRALayer, ecxept the activation function
-    def __init__(self, hidden_size, vocab_size, sub_vocab_dim, activation_func=None):
-        super().__init__()
-        std_dev = 1 / torch.sqrt(torch.tensor(sub_vocab_dim).float())
-        # TODO: Consider adding non-linear activation function
-        # TODO: Investigate the rationale of parameter initialization  Tingyuan: Maybe consider using random initialization with low variance
-        self.A = nn.Parameter(torch.randn(hidden_size, sub_vocab_dim) * std_dev)
-        self.B = nn.Parameter(torch.zeros(sub_vocab_dim, vocab_size))
-        self.activation_func = activation_func
-
-    def forward(self, x):
-        # x.shape: (..., hidden_size), A.shape: (hidden_size, sub_vocab_dim), B.shape: (sub_vocab_dim, vocab_size)
-        logits = x @ self.A
-        if self.activation_func is not None:
-            logits = self.activation_func(logits)
-        ada_vocab_logits = logits @ self.B  # ada_vocab_logits.shape: (..., vocab_size)
-        return ada_vocab_logits
+class AdaVocabHead(nn.Module):
+  def __init__(self, lm_head, sub_vocab_dim, dora=False, svd=False, activation_func=None):
+    self.dora = dora
+    hidden_size, vocab_size = lm_head.in_features, lm_head.out_features
+    super().__init__()
+    if svd: # SVD initialization
+      self.A, self.B = create_factorized_compression_for_linear(lm_head, sub_vocab_dim)
+      if dora: 
+        self.m = nn.Parameter(lm_head.weight.T.norm(p=2, dim=1, keepdim=True))  # (hidden_size, 1)
+    else:  # Random initialization
+      self.A = nn.Linear(hidden_size, sub_vocab_dim, bias=False)
+      self.B = nn.Linear(sub_vocab_dim, vocab_size, bias=False)
+      std_dev = 1 / math.sqrt(sub_vocab_dim)
+      nn.init.normal_(self.A.weight, 0, std_dev)
+      nn.init.zeros_(self.B.weight)
+    self.activation_func = activation_func
+    
+  def forward(self, x):
+    # x.shape: (..., hidden_size), A.shape: (hidden_size, sub_vocab_dim), B.shape: (sub_vocab_dim, vocab_size)
+    if self.dora:
+      comb_weight = self.A.weight.T @ self.B.weight.T  # (hidden_size, vocab_size)
+      norm_vec = comb_weight.norm(p=2, dim=1, keepdim=True)  # (hidden_size, 1)
+      directional_component = comb_weight / norm_vec  # (hidden_size, vocab_size)
+      dora_weight = self.m * directional_component  # (hidden_size, vocab_size)
+      ada_vocab_logits = x @ dora_weight  # ada_vocab_logits.shape: (..., vocab_size)
+    else:
+      logits = self.A(x)
+      if self.activation_func is not None:
+          logits = self.activation_func(logits)
+      ada_vocab_logits = self.B(logits)  # ada_vocab_logits.shape: (..., vocab_size)  
+    return ada_vocab_logits
 
 def create_AdaVocabCausalLM(base_class):  # Support LLamaForCausalLM
     class AdaVocabCausalLM(base_class):  
@@ -51,16 +164,15 @@ def create_AdaVocabCausalLM(base_class):  # Support LLamaForCausalLM
 
         def __init__(self, config):
             super().__init__(config)
-            self.sub_vocab_dim = config.hidden_size // config.ADA_RATIO  
+            self.sub_vocab_dim = config.ADA_DIM
             act_func = None
             if config.ADA_ACT:
                 act_func = torch.nn.GELU()
-            # AdaVocabHead is already initialized with random weights, 
+            # AdaVocabHead is already initialized with random weights/ SVD weights
             # so no need to use `self.post_init` method after this
-            self.adavocab_head = AdaVocabHead(config.hidden_size, 
-                                            config.vocab_size, 
-                                            self.sub_vocab_dim,
-                                            activation_func=act_func)
+            self.adavocab_head = AdaVocabHead(self.lm_head, self.sub_vocab_dim,
+                                              dora=config.ADA_DORA, svd=config.ADA_SVD,
+                                              activation_func=act_func)
 
             self.freeze_original_model()
         

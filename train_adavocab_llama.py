@@ -43,13 +43,15 @@ SafeSavingCallback.safe_minutes = SAFE_MINUTES
 
 @dataclass
 class AdaVocabArgs():
-    ADA_RATIO: int
+    ADA_DIM: int
     ADA_TOPK: int
     ADA_LOSS_WEIGHT: float
     ADA_MASK_WEIGHT: float
     ADA_TOPK_WEIGHT: float
     ADA_ACT: bool = False
-
+    ADA_DORA: bool = False
+    ADA_SVD: bool = False
+    
 @dataclass
 class PaddToMaxLenCollator(object):
     # Adapt from: https://github.com/ymcui/Chinese-LLaMA-Alpaca/blob/6e8c6c23e51ec8f0cf8a2b1f1633e52edb768e9c/scripts/training/build_dataset.py
