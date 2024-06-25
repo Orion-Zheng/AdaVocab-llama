@@ -124,37 +124,50 @@ class AdaCausalLMOutputWithPast(CausalLMOutputWithPast):
     mask_loss: Optional[torch.FloatTensor] = None
     topk_loss: Optional[torch.FloatTensor] = None
 
+class AdaVocabHead_MLP(nn.Module):
+  def __init__(self, lm_head, sub_vocab_dim, activation_func=torch.nn.GELU()):
+    hidden_size, vocab_size = lm_head.in_features, lm_head.out_features
+    super().__init__()
 
-class AdaVocabHead(nn.Module):
-  def __init__(self, lm_head, sub_vocab_dim, dora=False, svd=False, activation_func=None):
-    self.dora = dora
+    self.A = nn.Linear(hidden_size, sub_vocab_dim, bias=False)
+    self.B = nn.Linear(sub_vocab_dim, sub_vocab_dim, bias=True)
+    self.C = nn.Linear(sub_vocab_dim, vocab_size, bias=False)
+    std_dev = 1 / math.sqrt(sub_vocab_dim)
+    nn.init.normal_(self.A.weight, 0, std_dev)
+    nn.init.normal_(self.B.weight, 0, std_dev)
+    nn.init.zeros_(self.C.weight)
+    self.activation_func = activation_func
+    
+  def forward(self, x):
+    # x.shape: (..., hidden_size), 
+    # A.shape: (hidden_size, sub_vocab_dim)
+    # B.shape: (sub_vocab_dim, sub_vocab_dim)
+    # C.shape: (sub_vocab_dim, vocab_size)
+    logits = self.A(x)  # logits.shape: (..., sub_vocab_dim)
+    logits = self.activation_func(logits)  
+    logits = self.B(logits)  # logits.shape: (..., sub_vocab_dim)
+    logits = self.activation_func(logits) 
+    ada_vocab_logits = self.C(logits)  # ada_vocab_logits.shape: (..., vocab_size)  
+
+    return ada_vocab_logits
+
+class AdaVocabHead_LORA(nn.Module):
+  def __init__(self, lm_head, sub_vocab_dim, svd=False):
     hidden_size, vocab_size = lm_head.in_features, lm_head.out_features
     super().__init__()
     if svd: # SVD initialization
       self.A, self.B = create_factorized_compression_for_linear(lm_head, sub_vocab_dim)
-      if dora: 
-        self.m = nn.Parameter(lm_head.weight.T.norm(p=2, dim=1, keepdim=True))  # (hidden_size, 1)
     else:  # Random initialization
       self.A = nn.Linear(hidden_size, sub_vocab_dim, bias=False)
       self.B = nn.Linear(sub_vocab_dim, vocab_size, bias=False)
       std_dev = 1 / math.sqrt(sub_vocab_dim)
       nn.init.normal_(self.A.weight, 0, std_dev)
       nn.init.zeros_(self.B.weight)
-    self.activation_func = activation_func
     
   def forward(self, x):
     # x.shape: (..., hidden_size), A.shape: (hidden_size, sub_vocab_dim), B.shape: (sub_vocab_dim, vocab_size)
-    if self.dora:  # TODO: Some Bugs here. The loss get stuck.
-      comb_weight = self.A.weight.T @ self.B.weight.T  # (hidden_size, vocab_size)
-      norm_vec = comb_weight.norm(p=2, dim=1, keepdim=True)  # (hidden_size, 1)
-      directional_component = comb_weight / norm_vec  # (hidden_size, vocab_size)
-      dora_weight = self.m * directional_component  # (hidden_size, vocab_size)
-      ada_vocab_logits = x @ dora_weight  # ada_vocab_logits.shape: (..., vocab_size)
-    else:
-      logits = self.A(x)
-      if self.activation_func is not None:
-          logits = self.activation_func(logits)
-      ada_vocab_logits = self.B(logits)  # ada_vocab_logits.shape: (..., vocab_size)  
+    logits = self.A(x)
+    ada_vocab_logits = self.B(logits)  # ada_vocab_logits.shape: (..., vocab_size)  
     return ada_vocab_logits
 
 def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma 
@@ -165,14 +178,12 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
         def __init__(self, config):
             super().__init__(config)
             self.sub_vocab_dim = config.ADA_DIM
-            act_func = None
-            if config.ADA_ACT:
-                act_func = torch.nn.GELU()
             # AdaVocabHead is already initialized with random weights/ SVD weights
             # so no need to use `self.post_init` method after this
-            self.adavocab_head = AdaVocabHead(self.lm_head, self.sub_vocab_dim,
-                                              dora=config.ADA_DORA, svd=config.ADA_SVD,
-                                              activation_func=act_func)
+            if config.ADA_ACT:
+                self.adavocab_head = AdaVocabHead_MLP(self.lm_head, self.sub_vocab_dim, activation_func=nn.GELU())
+            else:
+                self.adavocab_head = AdaVocabHead_LORA(self.lm_head, self.sub_vocab_dim, svd=config.ADA_SVD)
 
             self.freeze_original_model()
         
@@ -196,6 +207,34 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
             # Only in top-k positions, put 1 to the corresponding position
             mask.scatter_(dim=-1, index=topk_indices, src=torch.ones_like(mask))
             return mask
+        
+        def pred_with_sliced_lm_head(self, ada_logits, hidden_states, input_ids, labels=None, min_logit=-float('inf')):
+            nll_loss = None
+            batch_size, seq_len, vocab_size = ada_logits.size()
+            ada_index_slice = torch.nonzero(ada_logits[:, -1, :] > 0, as_tuple=True)[-1]  # equivalent to `sigmoid(ada_logits) > 0.5`
+            union_ada_index_slice = torch.unique(ada_index_slice).to(self.lm_head.weight.device)  # torch_size([union_size])
+            sliced_lm_head_weight = self.lm_head.weight[union_ada_index_slice, :].contiguous()  # torch.Size([union_size, hidden_size])
+            ada_logits_sliced = hidden_states @ sliced_lm_head_weight.T  # (batch_size, seq_len, union_size)
+            
+            # Create a tensor of all `-inf`s with shape (batch_size, seq_len, vocab_size)
+            pred_lm_logits = torch.full((batch_size, seq_len, vocab_size), min_logit, 
+                                        dtype=ada_logits_sliced.dtype, device=input_ids.device)
+            # Use union_ada_index_slice for filling
+            # Assign the value of ada_logits to the specified location of pred_lm_logits through broadcasting
+            pred_lm_logits.scatter_(2, union_ada_index_slice.expand(batch_size, seq_len, -1).to(input_ids.device), 
+                                    ada_logits_sliced)  # (batch_size, seq_len, vocab_size)
+            if labels is not None:
+                # Shift so that tokens < n predict n
+                shift_logits = pred_lm_logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                # Flatten the tokens
+                loss_fct = CrossEntropyLoss()
+                shift_logits_flatten = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels_flatten = shift_labels.view(-1)
+
+                shift_labels_flatten = shift_labels_flatten.to(shift_logits.device)
+                nll_loss = loss_fct(shift_logits_flatten, shift_labels_flatten)
+            return pred_lm_logits, nll_loss
 
         def forward(
             self,
@@ -242,49 +281,10 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
             
             lm_head_logits = None
             lm_loss, mask_loss, topk_loss = None, None, None
-
             loss = None
-            if not self.training:
-                ada_topk_probs, ada_index = torch.topk(ada_logits, dim = -1, k = self.config.ADA_TOPK)
-                # del ada_logits
-                ada_index_slice = ada_index[:, -1, :]
-                union_ada_index_slice = torch.unique(ada_index_slice).to(self.lm_head.weight.device)   # torch_size([union_size])
-                    
-                sliced_lm_head_weight = self.lm_head.weight[union_ada_index_slice, :]  # torch.Size([union_size, 2048])
-                self.sliced_lm_head = nn.Linear(in_features=sliced_lm_head_weight.shape[1], out_features=sliced_lm_head_weight.shape[0],
-                                                dtype=self.lm_head.weight.dtype, bias=False)
-                
-                with torch.no_grad(): # No gradient update required
-                    self.sliced_lm_head.weight.copy_(sliced_lm_head_weight)  
-                # del sliced_lm_head_weight
-                self.sliced_lm_head.to(input_ids.device)
-                ada_logits_sliced = self.sliced_lm_head(hidden_states)  
-                
-                # Create a tensor of all 0s with shape [bs, len, vocab_size]
-                lm_logits_fill_dim = torch.zeros((batch_size, seq_len, vocab_size), 
-                                                 dtype=ada_logits_sliced.dtype, 
-                                                 device=input_ids.device)
 
-                # Use union_ada_index_slice for filling
-                # Assign the value of ada_logits to the specified location of lm_logits_fill_dim through broadcasting
-                lm_logits_fill_dim.scatter_(2, union_ada_index_slice.expand(batch_size, seq_len, -1).to(input_ids.device), 
-                                             ada_logits_sliced)
-                #The ada_logits_fill_dim here is actually the real logits
-                ada_logits = lm_logits_fill_dim  # (bs, seq_len, vocab_size)
-                if labels is not None:
-                    # Shift so that tokens < n predict n
-                    shift_logits = lm_logits_fill_dim[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    # Flatten the tokens
-                    loss_fct = CrossEntropyLoss()
-                    shift_logits = shift_logits.view(-1, self.config.vocab_size)
-                    shift_labels = shift_labels.view(-1)
-
-                    shift_labels = shift_labels.to(shift_logits.device)
-                    loss = loss_fct(shift_logits, shift_labels)
-
-            if self.training and (labels is not None):  # prediction_step, training_step. Not for generation
-                # ------ Only for Training ------
+            if labels is not None:  # For prediction_step, training_step. Not for generation
+                # ------ Only for Training and Eval Loop------
                 # During Inference, we don't need self.lm_head in GPU memory
                 lm_head_logits = self.lm_head(hidden_states)   # (batch_size, seq_len, vocab_size)  
                 lm_head_logits = lm_head_logits.float()
@@ -293,39 +293,47 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
                 # 1. (Primary) BCEWithLogitsLoss between ada_logits and topk_gt_mask (distillation signal)
                 # 2. CrossEntropyLoss between ada_logits and labels with constraint (from ground truth labels)
                 
+                if self.training:  # training_step
+                    # Loss from the second source
+                    # Shift so that tokens < n predict n
+                    shift_logits = ada_logits[..., :-1, :].contiguous()  # (batch_size, seq_len - 1, vocab_size)
+                    shift_labels = labels[..., 1:].contiguous()  # (batch_size, seq_len - 1)
+
+                    # Flatten the tokens
+                    loss_fct = CrossEntropyLoss()  # CE loss includes the softmax function
+                    shift_logits = shift_logits.view(-1, self.config.vocab_size)  # (batch_size * (seq_len - 1), vocab_size)
+
+                    shift_labels = shift_labels.view(-1)  # (batch_size * seq_len)
+                    shift_labels = shift_labels.to(shift_logits.device)
+                    
+                    lm_loss = loss_fct(shift_logits, shift_labels)
+                else:  # prediction_step
+                    _, lm_loss = self.pred_with_sliced_lm_head(ada_logits, hidden_states, input_ids, labels,
+                                                               min_logit=lm_head_logits.min().item())
+
                 # Loss from the first source
-                # Shift so that tokens < n predict n
-                shift_logits = ada_logits[..., :-1, :].contiguous()  # (batch_size, seq_len - 1, vocab_size)
-                shift_labels = labels[..., 1:].contiguous()  # (batch_size, seq_len - 1)
-
-                # Flatten the tokens
-                loss_fct = CrossEntropyLoss()  # CE loss includes the softmax function
-                shift_logits = shift_logits.view(-1, self.config.vocab_size)  # (batch_size * (seq_len - 1), vocab_size)
-
-                shift_labels = shift_labels.view(-1)  # (batch_size * seq_len)
-                shift_labels = shift_labels.to(shift_logits.device)
-                
-                lm_loss = loss_fct(shift_logits, shift_labels)
-                
-                # Loss from the second source
                 ada_logits_flat = ada_logits.view(-1, self.config.vocab_size)  # (batch_size * seq_len, vocab_size)
                 ada_probs = torch.sigmoid(ada_logits_flat)  # (batch_size * seq_len, vocab_size)
                 
                 topk_gt_mask = self.topk_mask(lm_head_logits)  # (batch_size, seq_len, vocab_size)
+                # TODO: Add weights from lm_head_logits
                 topk_gt_mask = topk_gt_mask.view(-1, self.config.vocab_size)  # (batch_size * seq_len, vocab_size)
                 
                 mask_loss_fct = BCEWithLogitsLoss()  # BCE Loss including the sigmoid function
                 mask_loss = mask_loss_fct(ada_logits_flat, topk_gt_mask)
 
                 ada_ones = ada_probs.sum()  # scalar
-                # TODO: Pad Token Handle
-                target_ones = batch_size * seq_len * self.config.ADA_TOPK # scalar  
+                # TODO: Handle pad token in no-packing case
+                target_ones = batch_size * seq_len * self.config.ADA_TOPK  # scalar
                 target_ones = torch.tensor(target_ones, dtype=torch.float32).to(ada_ones.device)
-                # Andy: we need to normalize this loss, make it agnostic to batch size, seq_len, topK
-                topk_loss = F.l1_loss(ada_ones, target_ones) / (batch_size * seq_len) 
+                # We need to normalize this loss, make it agnostic to batch size, seq_len, topK
+                topk_loss = F.l1_loss(ada_ones, target_ones) / target_ones
 
                 loss = self.config.ADA_LOSS_WEIGHT * lm_loss + self.config.ADA_MASK_WEIGHT * mask_loss + self.config.ADA_TOPK_WEIGHT * topk_loss
-                
+            else:  # For generation
+                with torch.no_grad():
+                    ada_logits, loss = self.pred_with_sliced_lm_head(ada_logits, hidden_states, input_ids, labels)
+
             if not return_dict:
                 output = (ada_logits,) + outputs[1:]
                 return (loss,) + output if loss is not None else output

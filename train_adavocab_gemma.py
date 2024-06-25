@@ -49,7 +49,6 @@ class AdaVocabArgs():
     ADA_MASK_WEIGHT: float
     ADA_TOPK_WEIGHT: float
     ADA_ACT: bool = False
-    ADA_DORA: bool = False
     ADA_SVD: bool = False
 
 @dataclass
@@ -134,15 +133,15 @@ def main():
         eval_preds.shape: (num_batch, ) * num of metrics
         """
         (token_accuracy, 
-        mask_hit_rate, 
-        top_k_diff, 
-        mask_top_1_hit_rate, 
-        mask_top_5_hit_rate,
-        mask_top_10_hit_rate,
-        mask_top_20_hit_rate,
-        lm_loss, 
-        mask_loss, 
-        topk_loss) = eval_preds.predictions
+         mask_hit_rate, 
+         top_k_diff, 
+         mask_top_1_hit_rate, 
+         mask_top_5_hit_rate,
+         mask_top_10_hit_rate,
+         mask_top_20_hit_rate,
+         lm_loss, 
+         mask_loss, 
+         topk_loss) = eval_preds.predictions
         return {'token_accuracy': token_accuracy.mean().item(), 
                 'mask_hit_rate': mask_hit_rate.mean().item(), 
                 'top_k_diff': top_k_diff.mean().item(),
@@ -210,7 +209,7 @@ def main():
         lm_loss = logits[2] 
         mask_loss = logits[3]
         topk_loss = logits[4]
-        assert ada_logits.shape == lm_head_logits.shape, "ada_logits and lm_head_logits should have the same shape."
+        # assert ada_logits.shape == lm_head_logits.shape, "ada_logits and lm_head_logits should have the same shape."
         
         bs = ada_logits.shape[0]
         seq_len = ada_logits.shape[1]
@@ -260,7 +259,8 @@ def main():
                 mask_top_20_hit_rate,
                 lm_loss, 
                 mask_loss, 
-                topk_loss)
+                topk_loss
+                )
     
     trainer = AdaTrainer(
         model=model,

@@ -49,7 +49,6 @@ class AdaVocabArgs():
     ADA_MASK_WEIGHT: float
     ADA_TOPK_WEIGHT: float
     ADA_ACT: bool = False
-    ADA_DORA: bool = False
     ADA_SVD: bool = False
 
 @dataclass
