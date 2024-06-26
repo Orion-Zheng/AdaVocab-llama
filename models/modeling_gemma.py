@@ -24,16 +24,16 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from transformers.modeling_attn_mask_utils import (
+from ...activations import ACT2FN
+from ...cache_utils import Cache, DynamicCache, StaticCache
+from ...modeling_attn_mask_utils import (
     AttentionMaskConverter,
     _prepare_4d_causal_attention_mask,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
-from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
-from transformers.utils import (
+from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+from ...modeling_utils import PreTrainedModel
+from ...pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
+from ...utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     is_flash_attn_2_available,
@@ -41,8 +41,8 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from transformers.utils.import_utils import is_torch_fx_available
-from transformers.models.gemma.configuration_gemma import GemmaConfig
+from ...utils.import_utils import is_torch_fx_available
+from .configuration_gemma import GemmaConfig
 
 
 if is_flash_attn_2_available():
@@ -849,7 +849,10 @@ class GemmaModel(GemmaPreTrainedModel):
             use_cache = False
 
         if inputs_embeds is None:
+            self.embed_tokens.to(input_ids.device) # TINGYUAN
             inputs_embeds = self.embed_tokens(input_ids)
+            self.embed_tokens.to("cpu") # TINGYUAN 
+            torch.cuda.empty_cache()
 
         return_legacy_cache = False
         if use_cache and not isinstance(past_key_values, Cache):  # kept for BC (non `Cache` `past_key_values` inputs)
@@ -884,6 +887,7 @@ class GemmaModel(GemmaPreTrainedModel):
         next_decoder_cache = None
 
         for decoder_layer in self.layers:
+            decoder_layer.to(hidden_states.device)  # TINGYUAN
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -908,7 +912,8 @@ class GemmaModel(GemmaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                 )
-
+            decoder_layer.to("cpu") #TINGYUAN
+            torch.cuda.empty_cache()
             hidden_states = layer_outputs[0]
 
             if use_cache:
@@ -916,8 +921,10 @@ class GemmaModel(GemmaPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-
+        self.norm.to(hidden_states.device) # TINGYUAN
         hidden_states = self.norm(hidden_states)
+        self.norm.to("cpu") # TINGYUAN
+        torch.cuda.empty_cache()
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
