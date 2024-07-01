@@ -327,7 +327,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
                 mask_loss = mask_loss_fct(ada_logits_flat, topk_gt_mask)
 
                 ada_ones = ada_probs.sum()  # scalar
-                # TODO: Handle pad token in no-packing case
+                # TODO: Handle pad token in no-packing case in the future
                 target_ones = batch_size * seq_len * self.config.ADA_TOPK  # scalar
                 target_ones = torch.tensor(target_ones, dtype=torch.float32).to(ada_ones.device)
                 # We need to normalize this loss, make it agnostic to batch size, seq_len, topK
@@ -336,6 +336,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
                 loss = self.config.ADA_LOSS_WEIGHT * lm_loss + self.config.ADA_MASK_WEIGHT * mask_loss + self.config.ADA_TOPK_WEIGHT * topk_loss
             else:  # For generation
                 with torch.no_grad():
+                    lm_head_logits = ada_logits
                     ada_logits, loss = self.pred_with_sliced_lm_head(ada_logits, hidden_states, input_ids, min_logit=-100)
 
             if not return_dict:
