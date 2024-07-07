@@ -849,9 +849,10 @@ class GemmaModel(GemmaPreTrainedModel):
             use_cache = False
 
         if inputs_embeds is None:
-            self.embed_tokens.to(input_ids.device) # TINGYUAN
-            inputs_embeds = self.embed_tokens(input_ids)
-            self.embed_tokens.to("cpu") # TINGYUAN 
+            orig_device = input_ids.device
+            input_ids = input_ids.to(self.embed_tokens.weight.device) # TINGYUAN
+            inputs_embeds = self.embed_tokens(input_ids) # TINGYUAN 
+            inputs_embeds = inputs_embeds.to(orig_device) 
             torch.cuda.empty_cache()
 
         return_legacy_cache = False
@@ -1116,7 +1117,13 @@ class GemmaForCausalLM(GemmaPreTrainedModel):
         )
 
         hidden_states = outputs[0]
+        # TINGYUAN
+        orig_device = self.lm_head.weight.device
+        self.lm_head.to(hidden_states.device)
         logits = self.lm_head(hidden_states)
+        self.lm_head.to(orig_device)
+        torch.cuda.empty_cache()
+        # TINGYUAN
         logits = logits.float()
         loss = None
         if labels is not None:
