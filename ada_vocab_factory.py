@@ -17,8 +17,9 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model, Qwen2PreTrained
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-from codebase.dist_logging import get_dist_logger
-logger = get_dist_logger()
+from models.modeling_gemma import GemmaForCausalLM
+from models.modeling_qwen2 import Qwen2ForCausalLM
+
 
 def svd_with_cache(matrix, cache_dir, max_rank=1024):
     """
@@ -36,11 +37,11 @@ def svd_with_cache(matrix, cache_dir, max_rank=1024):
 
     if os.path.exists(cache_file):
         # Load cached SVD results
-        logger.info(f"Loading cached SVD results from {cache_file}")
+
         U, S, Vh = torch.load(cache_file)
     else:
         # Perform SVD and cache the results
-        logger.info(f'Performing SVD and save to cache {cache_file}')
+
         U, S, Vh = torch.linalg.svd(matrix.float())
         U = U[:, :max_rank].clone()  # Shape: [out_features, rank]
         S = S[:max_rank].clone()     # Shape: [rank]
@@ -60,7 +61,7 @@ def create_factorized_compression_for_linear(source_linear, rank, svd_cache_dir=
     Returns:
         nn.Sequential: A sequential container of the compressed linear layers.
     """
-    logger.info(f"Creating SVD AdaHead with rank {rank}")
+
     with torch.no_grad():
         dtype = source_linear.weight.dtype
         # Check if the source linear layer has a bias term
@@ -179,6 +180,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
         def __init__(self, config):
             super().__init__(config)
             self.sub_vocab_dim = config.ADA_DIM
+            self.offload_tag = False
             # AdaVocabHead is already initialized with random weights/ SVD weights
             # so no need to use `self.post_init` method after this
             if config.ADA_ACT:
@@ -198,6 +200,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
                 param.requires_grad = True
         
         def offload_lm_head(self):
+            self.offload_tag = True
             self.lm_head = self.lm_head.to(torch.device('cpu'))
             
         def topk_mask(self, logits):
@@ -209,37 +212,23 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
             mask.scatter_(dim=-1, index=topk_indices, src=torch.ones_like(mask))
             return mask
         
-        def pred_with_sliced_lm_head(self, ada_logits, hidden_states, input_ids, labels=None, min_logit=-100):
-            nll_loss = None
+        def pred_with_sliced_lm_head_simple(self, ada_logits, hidden_states):
+            # nll_loss = None
             # Limit activated tokens to ADA_TOPK during inference
-            ada_logits_mask = self.topk_mask(ada_logits)  # (batch_size, seq_len, vocab_size)
-            ada_logits = ada_logits * ada_logits_mask  # (batch_size, seq_len, vocab_size)
-            
-            batch_size, seq_len, vocab_size = ada_logits.size()
-            ada_index_slice = torch.nonzero(ada_logits[:, -1, :] > 0, as_tuple=True)[-1]  # equivalent to `sigmoid(ada_logits) > 0.5`
-            union_ada_index_slice = torch.unique(ada_index_slice).to(self.lm_head.weight.device)  # torch_size([union_size])
-            sliced_lm_head_weight = self.lm_head.weight[union_ada_index_slice, :].contiguous()  # torch.Size([union_size, hidden_size])
-            ada_logits_sliced = hidden_states @ sliced_lm_head_weight.T  # (batch_size, seq_len, union_size)
-            
-            # Create a tensor of all `-inf`s with shape (batch_size, seq_len, vocab_size)
-            pred_lm_logits = torch.full((batch_size, seq_len, vocab_size), min_logit, 
-                                        dtype=ada_logits_sliced.dtype, device=input_ids.device)
-            # Use union_ada_index_slice for filling
-            # Assign the value of ada_logits to the specified location of pred_lm_logits through broadcasting
-            pred_lm_logits.scatter_(2, union_ada_index_slice.expand(batch_size, seq_len, -1).to(input_ids.device), 
-                                    ada_logits_sliced)  # (batch_size, seq_len, vocab_size)
-            if labels is not None:
-                # Shift so that tokens < n predict n
-                shift_logits = pred_lm_logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                # Flatten the tokens
-                loss_fct = CrossEntropyLoss()
-                shift_logits_flatten = shift_logits.view(-1, self.config.vocab_size)
-                shift_labels_flatten = shift_labels.view(-1)
+            # ada_logits_mask = self.topk_mask(ada_logits)  # (batch_size, seq_len, vocab_size)
+            ada_logits, topk_indices = torch.topk(ada_logits, self.config.ADA_TOPK, dim=-1) # ada_logits: # (batch_size, seq_len, vocab_size) = # (batch_size, 1, vocab_size)
 
-                shift_labels_flatten = shift_labels_flatten.to(shift_logits.device)
-                nll_loss = loss_fct(shift_logits_flatten, shift_labels_flatten)
-            return pred_lm_logits, nll_loss
+            # ada_logits = ada_logits * ada_logits_mask  # (batch_size, seq_len, vocab_size)
+            # ada_logits = topk_values
+            
+            # batch_size, seq_len, vocab_size = ada_logits.size()
+            gt_zero_pos = torch.nonzero(ada_logits[:, -1, :] > 0, as_tuple=True)[-1].shape[0]
+            ada_index_slice = topk_indices[:, :, :gt_zero_pos].flatten().to(self.lm_head.weight.device)  # equivalent to `sigmoid(ada_logits) > 0.5`
+            # union_ada_index_slice = torch.unique(ada_index_slice).to(self.lm_head.weight.device)  # torch_size([union_size])
+            sliced_lm_head_weight = self.lm_head.weight[ada_index_slice, :].contiguous().to(hidden_states.device)  # torch.Size([union_size, hidden_size])
+            lm_logits_sliced = hidden_states @ sliced_lm_head_weight.T  # (batch_size, seq_len, union_size)
+            
+            return lm_logits_sliced, ada_index_slice
 
         def forward(
             self,
@@ -281,8 +270,14 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
         
             # This activation could be very large during training if vocab_size is large,
             # but in inference, storing activation is not needed
-            ada_logits = self.adavocab_head(hidden_states)  # (batch_size, seq_len, vocab_size)  
-            ada_logits = ada_logits.float()
+            
+            # TINGYUAN
+            self.adavocab_head.A.to(hidden_states.device)
+            self.adavocab_head.B.to(hidden_states.device)
+            ada_logits = self.adavocab_head(hidden_states[:, -1:, :])  # (batch_size, seq_len, vocab_size)  
+            # ada_logits = ada_logits.float()
+            self.adavocab_head.A.to("cpu")
+            self.adavocab_head.B.to("cpu")
             
             lm_head_logits = None
             lm_loss, mask_loss, topk_loss = None, None, None
@@ -327,7 +322,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
                 mask_loss = mask_loss_fct(ada_logits_flat, topk_gt_mask)
 
                 ada_ones = ada_probs.sum()  # scalar
-                # TODO: Handle pad token in no-packing case in the future
+                # TODO: Handle pad token in no-packing case
                 target_ones = batch_size * seq_len * self.config.ADA_TOPK  # scalar
                 target_ones = torch.tensor(target_ones, dtype=torch.float32).to(ada_ones.device)
                 # We need to normalize this loss, make it agnostic to batch size, seq_len, topK
@@ -336,8 +331,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
                 loss = self.config.ADA_LOSS_WEIGHT * lm_loss + self.config.ADA_MASK_WEIGHT * mask_loss + self.config.ADA_TOPK_WEIGHT * topk_loss
             else:  # For generation
                 with torch.no_grad():
-                    lm_head_logits = ada_logits
-                    ada_logits, loss = self.pred_with_sliced_lm_head(ada_logits, hidden_states, input_ids, min_logit=-100)
+                    ada_logits, lm_head_logits = self.pred_with_sliced_lm_head_simple(ada_logits, hidden_states[:, -1:, :])
 
             if not return_dict:
                 output = (ada_logits,) + outputs[1:]
