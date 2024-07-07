@@ -17,7 +17,8 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model, Qwen2PreTrained
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-
+from models.modeling_gemma import GemmaForCausalLM
+from models.modeling_qwen2 import Qwen2ForCausalLM
 
 
 def svd_with_cache(matrix, cache_dir, max_rank=1024):
@@ -179,6 +180,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
         def __init__(self, config):
             super().__init__(config)
             self.sub_vocab_dim = config.ADA_DIM
+            self.offload_tag = False
             # AdaVocabHead is already initialized with random weights/ SVD weights
             # so no need to use `self.post_init` method after this
             if config.ADA_ACT:
@@ -198,6 +200,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
                 param.requires_grad = True
         
         def offload_lm_head(self):
+            self.offload_tag = True
             self.lm_head = self.lm_head.to(torch.device('cpu'))
             
         def topk_mask(self, logits):
@@ -222,7 +225,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
             gt_zero_pos = torch.nonzero(ada_logits[:, -1, :] > 0, as_tuple=True)[-1].shape[0]
             ada_index_slice = topk_indices[:, :, :gt_zero_pos].flatten().to(self.lm_head.weight.device)  # equivalent to `sigmoid(ada_logits) > 0.5`
             # union_ada_index_slice = torch.unique(ada_index_slice).to(self.lm_head.weight.device)  # torch_size([union_size])
-            sliced_lm_head_weight = self.lm_head.weight[ada_index_slice, :].contiguous()  # torch.Size([union_size, hidden_size])
+            sliced_lm_head_weight = self.lm_head.weight[ada_index_slice, :].contiguous().to(hidden_states.device)  # torch.Size([union_size, hidden_size])
             lm_logits_sliced = hidden_states @ sliced_lm_head_weight.T  # (batch_size, seq_len, union_size)
             
             return lm_logits_sliced, ada_index_slice
@@ -267,8 +270,14 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
         
             # This activation could be very large during training if vocab_size is large,
             # but in inference, storing activation is not needed
+            
+            # TINGYUAN
+            self.adavocab_head.A.to(hidden_states.device)
+            self.adavocab_head.B.to(hidden_states.device)
             ada_logits = self.adavocab_head(hidden_states[:, -1:, :])  # (batch_size, seq_len, vocab_size)  
             # ada_logits = ada_logits.float()
+            self.adavocab_head.A.to("cpu")
+            self.adavocab_head.B.to("cpu")
             
             lm_head_logits = None
             lm_loss, mask_loss, topk_loss = None, None, None
@@ -322,8 +331,7 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
                 loss = self.config.ADA_LOSS_WEIGHT * lm_loss + self.config.ADA_MASK_WEIGHT * mask_loss + self.config.ADA_TOPK_WEIGHT * topk_loss
             else:  # For generation
                 with torch.no_grad():
-                    ada_logits, ada_index = self.pred_with_sliced_lm_head_simple(ada_logits, hidden_states[:, -1:, :])
-                    lm_head_logits = ada_index
+                    ada_logits, lm_head_logits = self.pred_with_sliced_lm_head_simple(ada_logits, hidden_states[:, -1:, :])
 
             if not return_dict:
                 output = (ada_logits,) + outputs[1:]
