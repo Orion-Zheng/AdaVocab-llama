@@ -17,8 +17,202 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model, Qwen2PreTrained
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-from models.modeling_gemma import GemmaForCausalLM
-from models.modeling_qwen2 import Qwen2ForCausalLM
+# from .modeling_offload_gemma import GemmaForCausalLM
+# from .modeling_offload_qwen2 import Qwen2ForCausalLM
+# from .modeling_offload_llama import LlamaForCausalLM
+
+# sample package
+from types import MethodType
+from typing import Optional, Union
+from transformers.generation.utils import (LogitsProcessorList, 
+                                           StoppingCriteriaList, 
+                                           GenerationConfig, 
+                                           GenerateNonBeamOutput,
+                                           GenerateEncoderDecoderOutput,
+                                           GenerateDecoderOnlyOutput,
+                                           nn)
+from transformers.generation.streamers import BaseStreamer
+def adavocab_sample(
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
+        synced_gpus: bool,
+        streamer: Optional["BaseStreamer"],
+        logits_warper: Optional[LogitsProcessorList] = None,
+        **model_kwargs,
+    ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+        r"""
+        Generates sequences of token ids for models with a language modeling head using **multinomial sampling** and
+        can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
+
+        Parameters:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                The sequence used as a prompt for the generation.
+            logits_processor (`LogitsProcessorList`):
+                An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
+                used to modify the prediction scores of the language modeling head applied at each generation step.
+            stopping_criteria (`StoppingCriteriaList`):
+                An instance of [`StoppingCriteriaList`]. List of instances of class derived from [`StoppingCriteria`]
+                used to tell if the generation loop should stop.
+            generation_config ([`~generation.GenerationConfig`]):
+                The generation configuration to be used as parametrization of the decoding method.
+            synced_gpus (`bool`):
+                Whether to continue running the while loop until max_length (needed for ZeRO stage 3)
+            streamer (`BaseStreamer`, *optional*):
+                Streamer object that will be used to stream the generated sequences. Generated tokens are passed
+                through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
+            logits_warper (`LogitsProcessorList`, *optional*):
+                An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsWarper`] used
+                to warp the prediction score distribution of the language modeling head applied before multinomial
+                sampling at each generation step. Only required with sampling strategies (i.e. `do_sample` is set in
+                `generation_config`)
+            model_kwargs:
+                Additional model specific kwargs will be forwarded to the `forward` function of the model. If model is
+                an encoder-decoder model the kwargs should include `encoder_outputs`.
+
+        Return:
+            [`~generation.GenerateDecoderOnlyOutput`], [`~generation.GenerateEncoderDecoderOutput`] or `torch.LongTensor`:
+            A `torch.LongTensor` containing the generated tokens (default behaviour) or a
+            [`~generation.GenerateDecoderOnlyOutput`] if `model.config.is_encoder_decoder=False` and
+            `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
+            `model.config.is_encoder_decoder=True`.
+        """
+        # init values
+        pad_token_id = generation_config.pad_token_id
+        output_attentions = generation_config.output_attentions
+        output_hidden_states = generation_config.output_hidden_states
+        output_scores = generation_config.output_scores
+        output_logits = generation_config.output_logits
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
+        do_sample = generation_config.do_sample
+        if do_sample is True and not isinstance(logits_warper, LogitsProcessorList):
+            raise ValueError(
+                "`do_sample` is set to `True`, `logits_warper` must be a `LogitsProcessorList` instance (it is "
+                f"{logits_warper})."
+            )
+
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        raw_logits = () if (return_dict_in_generate and output_logits) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
+
+        # keep track of which sequences are already finished
+        batch_size = input_ids.shape[0]
+        this_peer_finished = False
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+
+        while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+            # prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if model_inputs['input_ids'].numel() == 1:
+                if model_inputs['input_ids'].flatten().item() == 36020 and model_inputs['position_ids'].flatten().item() == 581:
+                    print('debug')
+            # forward pass to get next token
+            outputs = self(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+
+            if synced_gpus and this_peer_finished:
+                continue  # don't waste resources running the code we don't need
+
+            next_token_logits = outputs.logits[:, -1, :]
+
+            # pre-process distribution
+            next_token_scores = logits_processor(input_ids, next_token_logits)
+            if do_sample:
+                next_token_scores = logits_warper(input_ids, next_token_scores)
+
+            # Store scores, attentions and hidden_states when required
+            if return_dict_in_generate:
+                if output_scores:
+                    scores += (next_token_scores,)
+                if output_logits:
+                    raw_logits += (next_token_logits,)
+                if output_attentions:
+                    decoder_attentions += (
+                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                    )
+                    if self.config.is_encoder_decoder:
+                        cross_attentions += (outputs.cross_attentions,)
+
+                if output_hidden_states:
+                    decoder_hidden_states += (
+                        (outputs.decoder_hidden_states,)
+                        if self.config.is_encoder_decoder
+                        else (outputs.hidden_states,)
+                    )
+
+            # token selection
+            if do_sample:
+                ada_index = outputs.lm_head_logits
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                selected_index = torch.multinomial(probs, num_samples=1).squeeze(1)
+                next_tokens = ada_index[selected_index]
+            else:
+                ada_index = outputs.lm_head_logits
+                top_one_index = torch.argmax(next_token_scores, dim=-1)
+                next_tokens = ada_index[top_one_index]
+
+            # finished sentences should have their next token be a padding token
+            if has_eos_stopping_criteria:
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # update generated ids, model inputs, and length for next step
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if streamer is not None:
+                streamer.put(next_tokens.cpu())
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+            )
+
+            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+            this_peer_finished = unfinished_sequences.max() == 0
+
+        if streamer is not None:
+            streamer.end()
+
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return GenerateEncoderDecoderOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    encoder_attentions=encoder_attentions,
+                    encoder_hidden_states=encoder_hidden_states,
+                    decoder_attentions=decoder_attentions,
+                    cross_attentions=cross_attentions,
+                    decoder_hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                )
+            else:
+                return GenerateDecoderOnlyOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    attentions=decoder_attentions,
+                    hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                )
+        else:
+            return input_ids
 
 
 def svd_with_cache(matrix, cache_dir, max_rank=1024):
@@ -172,15 +366,15 @@ class AdaVocabHead_LORA(nn.Module):
     ada_vocab_logits = self.B(logits)  # ada_vocab_logits.shape: (..., vocab_size)  
     return ada_vocab_logits
 
-def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma 
+def create_AdaVocabCausalLM(base_class, simple_infer):  # Support LLama, Qwen2, Gemma 
     class AdaVocabCausalLM(base_class):  
         # TODO: Check the function of this variable and if it affects the AdaVocab Head model
         _tied_weights_keys = ["lm_head.weight"]  
 
         def __init__(self, config):
+            config.offload_tag = False
             super().__init__(config)
             self.sub_vocab_dim = config.ADA_DIM
-            self.offload_tag = False
             # AdaVocabHead is already initialized with random weights/ SVD weights
             # so no need to use `self.post_init` method after this
             if config.ADA_ACT:
@@ -199,9 +393,9 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
             for param in self.adavocab_head.parameters():
                 param.requires_grad = True
         
-        def offload_lm_head(self):
-            self.offload_tag = True
-            self.lm_head = self.lm_head.to(torch.device('cpu'))
+        def offload(self):
+            self.config.offload_tag = True
+            self.to(torch.device('cpu'))
             
         def topk_mask(self, logits):
             # logits.shape: (batch_size, seq_len, vocab_size)
@@ -212,23 +406,46 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
             mask.scatter_(dim=-1, index=topk_indices, src=torch.ones_like(mask))
             return mask
         
-        def pred_with_sliced_lm_head_simple(self, ada_logits, hidden_states):
-            # nll_loss = None
+        def pred_with_sliced_lm_head(self, ada_logits, hidden_states, input_ids, labels=None, min_logit=-100):
+            nll_loss = None
             # Limit activated tokens to ADA_TOPK during inference
-            # ada_logits_mask = self.topk_mask(ada_logits)  # (batch_size, seq_len, vocab_size)
-            ada_logits, topk_indices = torch.topk(ada_logits, self.config.ADA_TOPK, dim=-1) # ada_logits: # (batch_size, seq_len, vocab_size) = # (batch_size, 1, vocab_size)
-
-            # ada_logits = ada_logits * ada_logits_mask  # (batch_size, seq_len, vocab_size)
-            # ada_logits = topk_values
+            ada_logits_mask = self.topk_mask(ada_logits)  # (batch_size, seq_len, vocab_size)
+            ada_logits = ada_logits * ada_logits_mask  # (batch_size, seq_len, vocab_size)
             
-            # batch_size, seq_len, vocab_size = ada_logits.size()
+            batch_size, seq_len, vocab_size = ada_logits.size()
+            ada_index_slice = torch.nonzero(ada_logits[:, -1, :] > 0, as_tuple=True)[-1]  # equivalent to `sigmoid(ada_logits) > 0.5`
+            union_ada_index_slice = torch.unique(ada_index_slice).to(self.lm_head.weight.device)  # torch_size([union_size])
+            sliced_lm_head_weight = self.lm_head.weight[union_ada_index_slice, :].contiguous().to(hidden_states.device)   # torch.Size([union_size, hidden_size])
+            ada_logits_sliced = hidden_states @ sliced_lm_head_weight.T  # (batch_size, seq_len, union_size)
+            
+            # Create a tensor of all `-inf`s with shape (batch_size, seq_len, vocab_size)
+            pred_lm_logits = torch.full((batch_size, seq_len, vocab_size), min_logit, 
+                                        dtype=ada_logits_sliced.dtype, device=input_ids.device)
+            # Use union_ada_index_slice for filling
+            # Assign the value of ada_logits to the specified location of pred_lm_logits through broadcasting
+            pred_lm_logits.scatter_(2, union_ada_index_slice.expand(batch_size, seq_len, -1).to(input_ids.device), 
+                                    ada_logits_sliced)  # (batch_size, seq_len, vocab_size)
+            if labels is not None:
+                # Shift so that tokens < n predict n
+                shift_logits = pred_lm_logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                # Flatten the tokens
+                loss_fct = CrossEntropyLoss()
+                shift_logits_flatten = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels_flatten = shift_labels.view(-1)
+
+                shift_labels_flatten = shift_labels_flatten.to(shift_logits.device)
+                nll_loss = loss_fct(shift_logits_flatten, shift_labels_flatten)
+            return pred_lm_logits, nll_loss
+        
+        def pred_with_sliced_lm_head_simple(self, ada_logits, hidden_states):
+            # Limit activated tokens to ADA_TOPK during inference
+            ada_logits, topk_indices = torch.topk(ada_logits, self.config.ADA_TOPK, dim=-1) # ada_logits: # (batch_size, seq_len, vocab_size) = # (batch_size, 1, vocab_size)
             gt_zero_pos = torch.nonzero(ada_logits[:, -1, :] > 0, as_tuple=True)[-1].shape[0]
             ada_index_slice = topk_indices[:, :, :gt_zero_pos].flatten().to(self.lm_head.weight.device)  # equivalent to `sigmoid(ada_logits) > 0.5`
-            # union_ada_index_slice = torch.unique(ada_index_slice).to(self.lm_head.weight.device)  # torch_size([union_size])
             sliced_lm_head_weight = self.lm_head.weight[ada_index_slice, :].contiguous().to(hidden_states.device)  # torch.Size([union_size, hidden_size])
             lm_logits_sliced = hidden_states @ sliced_lm_head_weight.T  # (batch_size, seq_len, union_size)
-            
-            return lm_logits_sliced, ada_index_slice
+            return lm_logits_sliced, ada_index_slice.to(lm_logits_sliced.device)
 
         def forward(
             self,
@@ -270,14 +487,18 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
         
             # This activation could be very large during training if vocab_size is large,
             # but in inference, storing activation is not needed
-            
-            # TINGYUAN
-            self.adavocab_head.A.to(hidden_states.device)
-            self.adavocab_head.B.to(hidden_states.device)
-            ada_logits = self.adavocab_head(hidden_states[:, -1:, :])  # (batch_size, seq_len, vocab_size)  
-            # ada_logits = ada_logits.float()
-            self.adavocab_head.A.to("cpu")
-            self.adavocab_head.B.to("cpu")
+            if self.config.offload_tag:
+                self.adavocab_head.A.to(hidden_states.device)
+                self.adavocab_head.B.to(hidden_states.device)
+            if simple_infer:
+                ada_logits = self.adavocab_head(hidden_states[:, -1:, :])  # (batch_size, 1, vocab_size)  
+            else:
+                ada_logits = self.adavocab_head(hidden_states)  # (batch_size, seq_len, vocab_size)
+                ada_logits = ada_logits.float()
+            if self.config.offload_tag:
+                self.adavocab_head.A.to("cpu")
+                self.adavocab_head.B.to("cpu")
+                torch.cuda.empty_cache()
             
             lm_head_logits = None
             lm_loss, mask_loss, topk_loss = None, None, None
@@ -331,7 +552,11 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
                 loss = self.config.ADA_LOSS_WEIGHT * lm_loss + self.config.ADA_MASK_WEIGHT * mask_loss + self.config.ADA_TOPK_WEIGHT * topk_loss
             else:  # For generation
                 with torch.no_grad():
-                    ada_logits, lm_head_logits = self.pred_with_sliced_lm_head_simple(ada_logits, hidden_states[:, -1:, :])
+                    if simple_infer:
+                        ada_logits, lm_head_logits = self.pred_with_sliced_lm_head_simple(ada_logits, hidden_states[:, -1:, :])
+                    else: 
+                        lm_head_logits = ada_logits
+                        ada_logits, loss = self.pred_with_sliced_lm_head(ada_logits, hidden_states, input_ids, min_logit=-100)
 
             if not return_dict:
                 output = (ada_logits,) + outputs[1:]
@@ -361,11 +586,10 @@ def create_AdaVocabCausalLM(base_class):  # Support LLama, Qwen2, Gemma
 
         def set_output_embeddings(self, new_embeddings):
             self.lm_head = new_embeddings
-        
-        # TODO: Add `get` and `set` methods for `adavocab_head`
+    if simple_infer:
+        AdaVocabCausalLM._sample = adavocab_sample
     return AdaVocabCausalLM
 
-AdaVocabLlamaForCausalLM = create_AdaVocabCausalLM(LlamaForCausalLM)
-AdaVocabGemmaforCausalLM = create_AdaVocabCausalLM(GemmaForCausalLM)
-AdaVocabQwen2ForCausalLM = create_AdaVocabCausalLM(Qwen2ForCausalLM)
-
+# AdaVocabLlamaForCausalLM = create_AdaVocabCausalLM(LlamaForCausalLM, False)
+AdaVocabGemmaforCausalLM = create_AdaVocabCausalLM(GemmaForCausalLM, False)
+# AdaVocabQwen2ForCausalLM = create_AdaVocabCausalLM(Qwen2ForCausalLM, False)
