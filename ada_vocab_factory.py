@@ -395,7 +395,10 @@ def create_AdaVocabCausalLM(base_class, simple_infer):  # Support LLama, Qwen2, 
         
         def offload(self):
             self.config.offload_tag = True
+            quant_method = getattr(self, "quantization_method", None)
+            self.quantization_method = None
             self.to(torch.device('cpu'))
+            self.quantization_method = quant_method
             
         def topk_mask(self, logits):
             # logits.shape: (batch_size, seq_len, vocab_size)
@@ -496,8 +499,8 @@ def create_AdaVocabCausalLM(base_class, simple_infer):  # Support LLama, Qwen2, 
                 ada_logits = self.adavocab_head(hidden_states)  # (batch_size, seq_len, vocab_size)
                 ada_logits = ada_logits.float()
             if self.config.offload_tag:
-                self.adavocab_head.A.to("cpu")
-                self.adavocab_head.B.to("cpu")
+                self.adavocab_head.A.to(torch.device("cpu"))
+                self.adavocab_head.B.to(torch.device("cpu"))
                 torch.cuda.empty_cache()
             
             lm_head_logits = None
