@@ -1,9 +1,11 @@
+import time
 import math
 import warnings
 import hashlib
 import os
 from typing import List, Optional, Tuple, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Dict
 
 import torch
 import torch.nn.functional as F
@@ -17,10 +19,6 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model, Qwen2PreTrained
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-# from .modeling_offload_gemma import GemmaForCausalLM
-# from .modeling_offload_qwen2 import Qwen2ForCausalLM
-# from .modeling_offload_llama import LlamaForCausalLM
-
 # sample package
 from types import MethodType
 from typing import Optional, Union
@@ -32,6 +30,11 @@ from transformers.generation.utils import (LogitsProcessorList,
                                            GenerateDecoderOnlyOutput,
                                            nn)
 from transformers.generation.streamers import BaseStreamer
+
+@dataclass
+class GenerateDecoderOnlyOutputWithTimeInfo(GenerateDecoderOnlyOutput):
+    time_info: Dict[str, float] = None
+
 def adavocab_sample(
         self,
         input_ids: torch.LongTensor,
@@ -113,8 +116,17 @@ def adavocab_sample(
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
-
+        prefill = True
+        generate_start = False
+        time_info = {'prefill_start_time': None, 'generate_start_time': None, 'generate_end_time': None}
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+            if generate_start is True:
+                time_info['generate_start_time'] = time.time()
+                generate_start = False
+            if prefill is True:
+                time_info['prefill_start_time'] = time.time()
+                prefill = False
+                generate_start = True
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             if model_inputs['input_ids'].numel() == 1:
@@ -185,7 +197,7 @@ def adavocab_sample(
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
             this_peer_finished = unfinished_sequences.max() == 0
-
+        time_info['generate_end_time'] = time.time()
         if streamer is not None:
             streamer.end()
 
@@ -203,16 +215,17 @@ def adavocab_sample(
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
             else:
-                return GenerateDecoderOnlyOutput(
+                return GenerateDecoderOnlyOutputWithTimeInfo(
                     sequences=input_ids,
                     scores=scores,
                     logits=raw_logits,
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
                     past_key_values=model_kwargs.get("past_key_values"),
+                    time_info=time_info
                 )
         else:
-            return input_ids
+            return input_ids, time_info
 
 
 def svd_with_cache(matrix, cache_dir, max_rank=1024):
@@ -395,10 +408,7 @@ def create_AdaVocabCausalLM(base_class, simple_infer):  # Support LLama, Qwen2, 
         
         def offload(self):
             self.config.offload_tag = True
-            quant_method = getattr(self, "quantization_method", None)
-            self.quantization_method = None
             self.to(torch.device('cpu'))
-            self.quantization_method = quant_method
             
         def topk_mask(self, logits):
             # logits.shape: (batch_size, seq_len, vocab_size)
@@ -445,6 +455,8 @@ def create_AdaVocabCausalLM(base_class, simple_infer):  # Support LLama, Qwen2, 
             # Limit activated tokens to ADA_TOPK during inference
             ada_logits, topk_indices = torch.topk(ada_logits, self.config.ADA_TOPK, dim=-1) # ada_logits: # (batch_size, seq_len, vocab_size) = # (batch_size, 1, vocab_size)
             gt_zero_pos = torch.nonzero(ada_logits[:, -1, :] > 0, as_tuple=True)[-1].shape[0]
+            if gt_zero_pos == 0:
+                gt_zero_pos = self.config.ADA_TOPK
             ada_index_slice = topk_indices[:, :, :gt_zero_pos].flatten().to(self.lm_head.weight.device)  # equivalent to `sigmoid(ada_logits) > 0.5`
             sliced_lm_head_weight = self.lm_head.weight[ada_index_slice, :].contiguous().to(hidden_states.device)  # torch.Size([union_size, hidden_size])
             lm_logits_sliced = hidden_states @ sliced_lm_head_weight.T  # (batch_size, seq_len, union_size)
@@ -499,8 +511,8 @@ def create_AdaVocabCausalLM(base_class, simple_infer):  # Support LLama, Qwen2, 
                 ada_logits = self.adavocab_head(hidden_states)  # (batch_size, seq_len, vocab_size)
                 ada_logits = ada_logits.float()
             if self.config.offload_tag:
-                self.adavocab_head.A.to(torch.device("cpu"))
-                self.adavocab_head.B.to(torch.device("cpu"))
+                self.adavocab_head.A.to("cpu")
+                self.adavocab_head.B.to("cpu")
                 torch.cuda.empty_cache()
             
             lm_head_logits = None
@@ -589,10 +601,11 @@ def create_AdaVocabCausalLM(base_class, simple_infer):  # Support LLama, Qwen2, 
 
         def set_output_embeddings(self, new_embeddings):
             self.lm_head = new_embeddings
+
     if simple_infer:
         AdaVocabCausalLM._sample = adavocab_sample
     return AdaVocabCausalLM
-
-# AdaVocabLlamaForCausalLM = create_AdaVocabCausalLM(LlamaForCausalLM, False)
-AdaVocabGemmaforCausalLM = create_AdaVocabCausalLM(GemmaForCausalLM, False)
-# AdaVocabQwen2ForCausalLM = create_AdaVocabCausalLM(Qwen2ForCausalLM, False)
+# Set simple_infer to `True` if you want to use the simplified sampling method during inference
+AdaVocabLlamaForCausalLM = create_AdaVocabCausalLM(LlamaForCausalLM, False)
+AdaVocabGemmaForCausalLM = create_AdaVocabCausalLM(GemmaForCausalLM, False)
+AdaVocabQwen2ForCausalLM = create_AdaVocabCausalLM(Qwen2ForCausalLM, False)
